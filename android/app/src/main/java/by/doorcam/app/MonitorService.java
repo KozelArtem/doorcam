@@ -30,15 +30,23 @@ public final class MonitorService extends Service {
     static volatile String lanUrl = "";
     static volatile MotionZone motionZone = MotionZone.FULL;
     static volatile boolean motionEnabled = true;
-    static volatile boolean calibrationVisible;
-    static volatile byte[] calibrationPreview;
+    static volatile boolean previewVisible;
+    static volatile byte[] previewFrame;
     static volatile long calibrationMotionAt;
     private static volatile CaptureHealth captureHealth;
     private static volatile String capture = "stopped";
     // A rapid Stop/Start must finish the previous camera and archive before reopening them.
     private static final HandlerThread cameraThread = new HandlerThread("DoorcamCapture");
     static { cameraThread.start(); }
-    private final Handler worker = new Handler(cameraThread.getLooper());
+    static Handler captureHandler() { return new Handler(cameraThread.getLooper()); }
+
+    static void setMotionEnabled(SharedPreferences settings, boolean enabled) {
+        motionEnabled = enabled;
+        if (!enabled) calibrationMotionAt = 0;
+        settings.edit().putBoolean(MOTION_ENABLED, enabled).apply();
+    }
+
+    private final Handler worker = captureHandler();
     private final Handler main = new Handler(Looper.getMainLooper());
     private volatile boolean destroyed;
     private boolean started;
@@ -193,7 +201,7 @@ public final class MonitorService extends Service {
 
     private void retry(Exception error) {
         if (destroyed) return;
-        calibrationPreview = null;
+        previewFrame = null;
         calibrationMotionAt = 0;
         Log.w("Doorcam", "Повторный запуск захвата", error);
         if (camera != null) { camera.close(); camera = null; }
@@ -210,7 +218,7 @@ public final class MonitorService extends Service {
             capture = "stopped";
             captureHealth = null;
             status = "Наблюдение остановлено";
-            calibrationPreview = null;
+            previewFrame = null;
             calibrationMotionAt = 0;
         }
         worker.removeCallbacksAndMessages(null);

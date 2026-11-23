@@ -19,6 +19,7 @@ import android.graphics.drawable.RippleDrawable;
 import android.hardware.camera2.*;
 import android.os.*;
 import android.text.InputType;
+import android.util.Log;
 import android.view.*;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.*;
@@ -33,6 +34,7 @@ import java.util.concurrent.TimeUnit;
 
 public final class MainActivity extends Activity {
     private static final int HOME = 0, SETTINGS = 1;
+    private static final int CAMERA_PREVIEW_PERMISSION = 3;
     private final ScrollView[] pages = new ScrollView[2];
     private final Button[] tabs = new Button[pages.length];
     private int selectedTab = HOME;
@@ -46,6 +48,7 @@ public final class MainActivity extends Activity {
     private CheckBox calibration;
     private TextView calibrationStatus;
     private ZonePreview zonePreview;
+    private AlertDialog cameraPreviewDialog;
     private MotionZone motionZone;
     private byte[] displayedPreview;
     private final List<String> ids = new ArrayList<>();
@@ -71,7 +74,7 @@ public final class MainActivity extends Activity {
             limit.setEnabled(!active);
             origin.setEnabled(!active);
             key.setEnabled(!active);
-            if (MonitorService.calibrationVisible) refreshCalibration(active);
+            if (isCalibrating()) refreshCalibration(active);
             ui.postDelayed(this, 750);
         }
     };
@@ -196,29 +199,92 @@ public final class MainActivity extends Activity {
         detector.setSwitchPadding(dp(12));
         detector.setChecked(prefs.getBoolean(MonitorService.MOTION_ENABLED, true));
         add(hero, detector, 2);
-        detector.setOnCheckedChangeListener((button, checked) -> {
-            prefs.edit().putBoolean(MonitorService.MOTION_ENABLED, checked).apply();
-            MonitorService.motionEnabled = checked;
-        });
+        detector.setOnCheckedChangeListener((button, checked) -> MonitorService.setMotionEnabled(prefs, checked));
     }
 
     private void showCameraPreview() {
+        if (cameraPreviewDialog != null) return;
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.CAMERA}, CAMERA_PREVIEW_PERMISSION);
+            return;
+        }
+        boolean active = MonitorService.running;
+        if (!active && ids.isEmpty()) populateCameras();
+        int selection = cameras.getSelectedItemPosition();
+        if (!active && selection == AdapterView.INVALID_POSITION) {
+            message("Камера не найдена");
+            return;
+        }
         LinearLayout content = column();
         content.setPadding(dp(18), dp(10), dp(18), 0);
         FrameLayout frame = new FrameLayout(this);
         frame.setBackground(surface(R.color.doorcam_background, 16, R.color.doorcam_border));
-        content.addView(frame, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(132)));
+        frame.setClipToOutline(true);
+        int height = Math.min(260, getResources().getConfiguration().screenHeightDp / 2);
+        content.addView(frame, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(height)));
+        ImageView image = new ImageView(this);
+        image.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        image.setContentDescription("Изображение с камеры");
+        frame.addView(image, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         ImageView lens = new ImageView(this);
         lens.setImageResource(R.drawable.doorcam_lens);
         lens.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         frame.addView(lens, new FrameLayout.LayoutParams(dp(44), dp(44), Gravity.CENTER));
-        label(content, "Изображение с камеры пока недоступно", 13, R.color.doorcam_muted, 8);
+        TextView previewStatus = label(content, "Ждём кадр с камеры…", 13, R.color.doorcam_muted, 8);
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle("Предпросмотр камеры").setView(content)
                 .setPositiveButton("Закрыть", null).create();
+        Handler worker = MonitorService.captureHandler();
+        CameraMonitor local = active ? null : new CameraMonitor(this, worker, new CameraMonitor.State() {
+            @Override public void ready() { }
+            @Override public void failed(Exception error) {
+                Log.w("Doorcam", "Предпросмотр камеры", error);
+                ui.post(() -> {
+                    if (dialog.isShowing()) previewStatus.setText("Не удалось получить изображение с камеры");
+                });
+            }
+        });
+        Runnable refreshPreview = new Runnable() {
+            private byte[] displayed;
+            @Override public void run() {
+                if (!dialog.isShowing()) return;
+                byte[] bytes = local == null ? MonitorService.previewFrame : local.previewFrame;
+                if (bytes != displayed) {
+                    displayed = bytes;
+                    image.setImageBitmap(bytes == null ? null : BitmapFactory.decodeByteArray(bytes, 0, bytes.length));
+                    lens.setVisibility(bytes == null ? View.VISIBLE : View.GONE);
+                    previewStatus.setVisibility(bytes == null ? View.VISIBLE : View.GONE);
+                }
+                if (local == null && bytes == null) {
+                    String status = MonitorService.captureState();
+                    previewStatus.setText("ok".equals(status) || "starting".equals(status)
+                            ? "Ждём кадр с камеры…" : MonitorService.status);
+                }
+                ui.postDelayed(this, 250);
+            }
+        };
+        cameraPreviewDialog = dialog;
+        MonitorService.previewVisible = active;
+        dialog.setOnDismissListener(dismissed -> {
+            ui.removeCallbacks(refreshPreview);
+            if (local != null) worker.post(local::close);
+            cameraPreviewDialog = null;
+            updateCalibrationVisibility();
+        });
         dialog.show();
         dialog.getWindow().setBackgroundDrawable(new InsetDrawable(
                 surface(R.color.doorcam_surface, 22, R.color.doorcam_border), dp(12), 0, dp(12), 0));
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setAllCaps(false);
+        if (local != null) {
+            String cameraId = ids.get(selection);
+            worker.post(() -> {
+                try {
+                    local.start(cameraId);
+                } catch (Exception error) {
+                    local.failed(error);
+                }
+            });
+        }
+        ui.post(refreshPreview);
     }
 
     private void buildWifi(LinearLayout wifi) {
@@ -393,11 +459,16 @@ public final class MainActivity extends Activity {
         });
     }
 
+    private boolean isCalibrating() {
+        return selectedTab == SETTINGS && recordingSection.isChecked() && calibration.isChecked();
+    }
+
     private void updateCalibrationVisibility() {
-        boolean visible = selectedTab == SETTINGS && recordingSection.isChecked() && calibration.isChecked();
-        MonitorService.calibrationVisible = visible;
-        if (visible) refreshCalibration(MonitorService.running);
-        else clearCalibrationPreview();
+        boolean calibrating = isCalibrating();
+        MonitorService.previewVisible = calibrating || cameraPreviewDialog != null;
+        if (calibrating) refreshCalibration(MonitorService.running);
+        if (cameraPreviewDialog == null && !calibrating) MonitorService.previewFrame = null;
+        if (!calibrating) clearCalibrationPreview();
     }
 
     private void applyMotionZone(MotionZone zone) {
@@ -409,7 +480,7 @@ public final class MainActivity extends Activity {
     }
 
     private void refreshCalibration(boolean active) {
-        byte[] preview = active ? MonitorService.calibrationPreview : null;
+        byte[] preview = active ? MonitorService.previewFrame : null;
         if (displayedPreview != preview) {
             displayedPreview = preview;
             zonePreview.setImageBitmap(preview == null ? null : BitmapFactory.decodeByteArray(preview, 0, preview.length));
@@ -423,7 +494,6 @@ public final class MainActivity extends Activity {
     }
 
     private void clearCalibrationPreview() {
-        MonitorService.calibrationPreview = null;
         displayedPreview = null;
         zonePreview.setImageDrawable(null);
     }
@@ -613,6 +683,10 @@ public final class MainActivity extends Activity {
                 populateCameras(); prepare();
             } else message("Разрешите доступ к камере в настройках приложения");
         } else if (code == 2) prepare();
+        else if (code == CAMERA_PREVIEW_PERMISSION) {
+            if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) showCameraPreview();
+            else message("Разрешите доступ к камере в настройках приложения");
+        }
     }
     @Override protected void onResume() {
         super.onResume();
@@ -632,7 +706,9 @@ public final class MainActivity extends Activity {
 
     @Override protected void onPause() {
         ui.removeCallbacks(refresh);
-        MonitorService.calibrationVisible = false;
+        if (cameraPreviewDialog != null) cameraPreviewDialog.dismiss();
+        MonitorService.previewVisible = false;
+        MonitorService.previewFrame = null;
         clearCalibrationPreview();
         resourceSampler.shutdownNow();
         resourceSampler = null;

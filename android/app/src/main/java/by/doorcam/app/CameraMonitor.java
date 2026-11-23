@@ -24,6 +24,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 
 final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
     interface State { void ready(); void failed(Exception e); }
@@ -42,9 +44,14 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
     private long previousPreview;
     private int rotation;
     private boolean closed, ready;
+    volatile byte[] previewFrame;
     private final Runnable checkCapture = new Runnable() {
         @Override public void run() {
             if (closed) return;
+            if (archive == null) {
+                if (previewFrame == null) failed(new IOException("Камера не передаёт кадры"));
+                return;
+            }
             String failure = health.failure(SystemClock.elapsedRealtime());
             if (failure != null) {
                 failed(new IOException(failure));
@@ -69,7 +76,11 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
         this.link = link;
         this.live = live;
         this.state = state;
-        detector = new MotionDetector(sensitivity);
+        detector = archive == null ? null : new MotionDetector(sensitivity);
+    }
+
+    CameraMonitor(Context context, Handler worker, State state) {
+        this(context, worker, null, null, null, state, 0);
     }
 
     @Override public long now() { return epoch + SystemClock.elapsedRealtime(); }
@@ -80,7 +91,11 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
     @Override public void liveSegment(Archive.Segment segment, long end) throws IOException {
         if (link != null && link.wantsLive()) link.onSegment(archive.finishLive(segment, end));
     }
-    @Override public void failed(Exception e) { if (!closed) state.failed(e); }
+    @Override public void failed(Exception e) {
+        if (closed) return;
+        if (archive == null) close();
+        state.failed(e);
+    }
 
     @SuppressLint("MissingPermission")
     void start(String id) throws Exception {
@@ -88,7 +103,6 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
         CameraCharacteristics caps = manager.getCameraCharacteristics(id);
         StreamConfigurationMap streams = caps.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
         if (streams == null) throw new IOException("Сведения о камере недоступны");
-        Size video = select(streams.getOutputSizes(MediaRecorder.class), 1280, 720);
         Size analysis = select(streams.getOutputSizes(ImageFormat.YUV_420_888), 640, 480);
         Integer sensor = caps.get(CameraCharacteristics.SENSOR_ORIENTATION);
         int display = context.getSystemService(WindowManager.class).getDefaultDisplay().getRotation() * 90;
@@ -96,21 +110,28 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
         rotation = ((sensor == null ? 0 : sensor) + (lens != null && lens == CameraCharacteristics.LENS_FACING_FRONT ? display : -display) + 360) % 360;
         reader = ImageReader.newInstance(analysis.getWidth(), analysis.getHeight(), ImageFormat.YUV_420_888, 3);
         reader.setOnImageAvailableListener(this::analyze, worker);
-        encoder = new SegmentEncoder(rotation, this, live);
-        Surface videoSurface = encoder.start(video, worker);
-        worker.postDelayed(checkCapture, 2_000);
+        Surface imageSurface = reader.getSurface();
+        boolean recording = archive != null;
+        List<Surface> targets;
+        if (recording) {
+            Size video = select(streams.getOutputSizes(MediaRecorder.class), 1280, 720);
+            encoder = new SegmentEncoder(rotation, this, live);
+            targets = Arrays.asList(encoder.start(video, worker), imageSurface);
+        } else {
+            targets = Collections.singletonList(imageSurface);
+        }
+        worker.postDelayed(checkCapture, recording ? 2_000 : 8_000);
         manager.openCamera(id, new CameraDevice.StateCallback() {
             @Override public void onOpened(CameraDevice device) {
                 if (closed) { device.close(); return; }
                 camera = device;
                 try {
-                    Surface imageSurface = reader.getSurface();
-                    CaptureRequest.Builder request = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
-                    request.addTarget(imageSurface);
-                    request.addTarget(videoSurface);
+                    CaptureRequest.Builder request = camera.createCaptureRequest(
+                            recording ? CameraDevice.TEMPLATE_RECORD : CameraDevice.TEMPLATE_PREVIEW);
+                    for (Surface target : targets) request.addTarget(target);
                     Range<Integer> rate = frameRate(caps.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES));
                     if (rate != null) request.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, rate);
-                    camera.createCaptureSession(Arrays.asList(videoSurface, imageSurface), new CameraCaptureSession.StateCallback() {
+                    camera.createCaptureSession(targets, new CameraCaptureSession.StateCallback() {
                         @Override public void onConfigured(CameraCaptureSession configured) {
                             if (closed) { configured.close(); return; }
                             session = configured;
@@ -162,6 +183,13 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
             if (image == null || now - previousFrame < 180) return;
             previousFrame = now;
             long elapsed = SystemClock.elapsedRealtime();
+            if (archive == null) {
+                if (elapsed - previousPreview >= 250) {
+                    previousPreview = elapsed;
+                    previewFrame = jpeg(image);
+                }
+                return;
+            }
             health.frame(elapsed);
             byte[] photo = null;
             if (!MonitorService.motionEnabled) {
@@ -170,17 +198,17 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
             } else if (detectMotion(image)) {
                 MonitorService.calibrationMotionAt = elapsed;
                 if (archive.needsPhoto(now)) photo = jpeg(image);
-                if (archive.motion(now, photo)) {
+                if (MonitorService.motionEnabled && archive.motion(now, photo)) {
                     MonitorService.lastEvent = now;
                     encoder.onMotion(now);
                 }
             }
-            if (MonitorService.calibrationVisible && elapsed - previousPreview >= 1_000) {
+            if (MonitorService.previewVisible && elapsed - previousPreview >= 500) {
                 previousPreview = elapsed;
                 try {
-                    MonitorService.calibrationPreview = photo != null ? photo : jpeg(image);
+                    MonitorService.previewFrame = photo != null ? photo : jpeg(image);
                 } catch (IOException e) {
-                    Log.w("Doorcam", "Предпросмотр зоны", e);
+                    Log.w("Doorcam", "Предпросмотр камеры", e);
                 }
             }
         } catch (Exception error) { failed(error); }
@@ -238,12 +266,14 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
     }
 
     @Override public void close() {
+        if (closed) return;
         closed = true;
+        previewFrame = null;
         worker.removeCallbacks(checkCapture);
         if (session != null) session.close();
         if (camera != null) camera.close();
         if (reader != null) reader.close();
         if (encoder != null) encoder.close();
-        if (archive.endCapture() && link != null) link.onEvent();
+        if (archive != null && archive.endCapture() && link != null) link.onEvent();
     }
 }
