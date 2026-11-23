@@ -115,8 +115,11 @@ const clips = document.querySelector('#clips');
 const clipRow = document.querySelector('#clip-row');
 const archiveStatus = document.querySelector('#archive-status');
 const recording = document.querySelector('#recording');
+const download = document.querySelector('#download');
 const refresh = document.querySelector('#refresh');
 const date = new Intl.DateTimeFormat('ru', { dateStyle: 'medium', timeStyle: 'medium' });
+const day = new Intl.DateTimeFormat('ru', { dateStyle: 'medium' });
+const time = new Intl.DateTimeFormat('ru', { timeStyle: 'medium' });
 let archiveRequest;
 
 async function list(path, signal) {
@@ -128,6 +131,8 @@ async function list(path, signal) {
 function clearRecording() {
   clipRow.hidden = true;
   clips.replaceChildren();
+  download.hidden = true;
+  download.removeAttribute('href');
   recording.hidden = true;
   recording.removeAttribute('src');
   recording.load();
@@ -152,6 +157,24 @@ async function loadClips() {
   }
 }
 
+function groupEvents(entries) {
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  const labels = new Map([[today.toDateString(), 'Сегодня'], [yesterday.toDateString(), 'Вчера']]);
+  const groups = new Map();
+  for (const id of entries) {
+    const key = new Date(id).toDateString();
+    if (!groups.has(key)) {
+      const group = document.createElement('optgroup');
+      group.label = labels.get(key) || day.format(id);
+      groups.set(key, group);
+    }
+    groups.get(key).append(new Option(time.format(id), id));
+  }
+  return groups.values();
+}
+
 async function loadEvents() {
   if (archiveRequest) archiveRequest.abort();
   const request = new AbortController();
@@ -162,8 +185,7 @@ async function loadEvents() {
   archiveStatus.textContent = 'Загрузка записей…';
   try {
     const entries = await list('/events', request.signal);
-    events.replaceChildren(new Option('Выберите событие', ''),
-      ...entries.reverse().map(id => new Option(date.format(id), id)));
+    events.replaceChildren(new Option('Выберите событие', ''), ...groupEvents(entries.reverse()));
     events.value = entries.includes(Number(selected)) ? selected : '';
     events.disabled = entries.length === 0;
     archiveStatus.textContent = entries.length ? '' : 'Записей пока нет.';
@@ -178,8 +200,12 @@ async function loadEvents() {
 }
 
 function showClip(play = false) {
-  recording.src = '/archive/' + events.value + '/' + clips.value + '.mp4';
+  const path = '/archive/' + events.value + '/' + clips.value + '.mp4';
+  recording.src = path;
   recording.hidden = false;
+  download.href = path;
+  download.download = 'doorcam-' + clips.value + '.mp4';
+  download.hidden = false;
   if (play) recording.play().catch(() => {});
 }
 

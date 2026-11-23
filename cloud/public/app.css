@@ -7,6 +7,10 @@ h1,h2,p{margin:0}h1{font-size:clamp(2rem,5vw,3.35rem);letter-spacing:-.05em;line
 .transport,.history-head{padding:1rem 1.2rem}.transport{flex-wrap:wrap}.transport>div{margin-right:auto}#player-info{display:block;font-size:.9rem;color:#acbcc0;margin-top:.2rem}.accent,button.accent{background:#a9efcd;color:#0c3024;border-color:transparent;font-weight:650}.accent:hover{filter:brightness(1.05)}.history-head{border-bottom:1px solid #32434b;flex-wrap:wrap}.history button{font-size:.93rem;min-height:44px}.archive-list{max-height:60vh;overflow:auto}#archive-status:not(:empty){padding:1rem 1.2rem;color:#bbc6c7}.date{margin:1rem 1.2rem .4rem;font-size:.87rem;color:#a6b7bc;font-weight:550}.clip{display:flex;width:100%;align-items:center;gap:1rem;text-align:left;border:0;border-radius:0;padding:.65rem 1.2rem}.clip:hover,.clip[aria-current=true]{background:#273a40}.thumb{flex:none;width:4.3rem;height:2.7rem;display:grid;place-items:center;background:#0c171c;color:#859f9e;border-radius:.3rem;overflow:hidden}.thumb img{width:100%;height:100%;object-fit:cover}.clip time{font-variant-numeric:tabular-nums;font-weight:600}.clip-current{margin-left:auto;color:#a9efcd;font-size:.8rem}.clip:focus-visible{outline-offset:-3px}#more{margin:1rem}
 #gate{max-width:30rem;margin:clamp(4rem,14vh,10rem) auto;text-align:center}#gate .lens{margin:1rem auto 2.6rem}#gate p{line-height:1.5;color:#b9c8c8;margin:1rem 0 1.75rem}#login{display:inline-block}
 
+.camera-state{display:grid;gap:.25rem;font-size:.95rem;color:#b9c6c9}#capture-status:empty{display:none}
+#playback-info:not(:empty){display:block;font-size:.9rem;color:#acbcc0;margin-top:.2rem}
+.download{display:inline-flex;align-items:center;min-height:44px;border:1px solid #526269;border-radius:.5rem;padding:.58rem 1rem;color:inherit;text-decoration:none}
+#older{margin:1rem}
 .archive-filters{display:flex;flex-wrap:wrap;gap:.5rem;padding:.85rem 1.2rem .15rem}
 .archive-filters button,.archive-filters select{padding:.45rem .6rem}
 .archive-filters button[aria-pressed=true]{background:#a9efcd;border-color:transparent;color:#0c3024;font-weight:650}

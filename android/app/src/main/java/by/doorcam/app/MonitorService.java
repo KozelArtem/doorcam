@@ -27,6 +27,12 @@ public final class MonitorService extends Service {
     static volatile String status = "Наблюдение остановлено";
     static volatile long lastEvent;
     static volatile String lanUrl = "";
+    static volatile MotionZone motionZone = MotionZone.FULL;
+    static volatile boolean calibrationVisible;
+    static volatile byte[] calibrationPreview;
+    static volatile long calibrationMotionAt;
+    private static volatile CaptureHealth captureHealth;
+    private static volatile String capture = "stopped";
     // A rapid Stop/Start must finish the previous camera and archive before reopening them.
     private static final HandlerThread cameraThread = new HandlerThread("DoorcamCapture");
     static { cameraThread.start(); }
@@ -43,6 +49,14 @@ public final class MonitorService extends Service {
     private LanServer lan;
     private Network wifi;
     private ConnectivityManager.NetworkCallback wifiCallback;
+
+    static String captureState() {
+        String state = capture;
+        CaptureHealth health = captureHealth;
+        if (("ok".equals(state) || "starting".equals(state)) && health != null
+                && health.failure(SystemClock.elapsedRealtime()) != null) return "failed";
+        return state;
+    }
 
     static synchronized String lanPassword(SharedPreferences settings) {
         String password = settings.getString("lanPassword", "");
@@ -84,18 +98,22 @@ public final class MonitorService extends Service {
         }
         started = true;
         running = true;
+        captureHealth = null;
+        capture = "starting";
         status = "Подготовка камеры";
+        motionZone = MotionZone.read(getSharedPreferences("doorcam", MODE_PRIVATE));
         wakeLock = getSystemService(PowerManager.class).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Doorcam:Capture");
         wakeLock.acquire();
         worker.post(this::open);
         return START_STICKY;
     }
 
-    private void report(String text) {
-        if (destroyed) return;
-        status = text;
+    private void report(String state, String text) {
         main.post(() -> {
-            if (!destroyed) getSystemService(NotificationManager.class).notify(NOTIFICATION, notification(text));
+            if (destroyed) return;
+            capture = state;
+            status = text;
+            getSystemService(NotificationManager.class).notify(NOTIFICATION, notification(text));
         });
     }
 
@@ -103,20 +121,22 @@ public final class MonitorService extends Service {
         if (destroyed) return;
         SharedPreferences settings = getSharedPreferences("doorcam", MODE_PRIVATE);
         try {
-            if (archive == null) archive = new Archive(getFilesDir(), settings.getInt("limit", 1024) * 1024L * 1024L);
-            if (wifiCallback == null) watchWifi(lanPassword(settings));
             String origin = settings.getString("origin", ""), key = settings.getString("key", "");
-            if (remote == null && !origin.isEmpty() && !key.isEmpty()) {
-                remote = new RemoteLink(getApplicationContext(), origin, key, archive.archiveDir);
+            boolean remoteEnabled = !origin.isEmpty() && !key.isEmpty();
+            if (archive == null) archive = new Archive(getFilesDir(), settings.getInt("limit", 1024) * 1024L * 1024L, remoteEnabled);
+            if (wifiCallback == null) watchWifi(lanPassword(settings));
+            if (remote == null && remoteEnabled) {
+                remote = new RemoteLink(getApplicationContext(), origin, key, archive);
                 remote.start();
             }
             camera = new CameraMonitor(this, worker, archive, remote, live, new CameraMonitor.State() {
                 @Override public void ready() {
                     retryMs = 1000;
-                    report("Наблюдение включено");
+                    report("ok", "Наблюдение включено");
                 }
                 @Override public void failed(Exception e) { retry(e); }
             }, settings.getInt("sensitivity", 50));
+            captureHealth = camera.health;
             camera.start(settings.getString("camera", "0"));
         } catch (Exception e) { retry(e); }
     }
@@ -169,10 +189,12 @@ public final class MonitorService extends Service {
 
     private void retry(Exception error) {
         if (destroyed) return;
+        calibrationPreview = null;
+        calibrationMotionAt = 0;
         Log.w("Doorcam", "Повторный запуск захвата", error);
         if (camera != null) { camera.close(); camera = null; }
         String reason = error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage();
-        report("Повтор через " + retryMs / 1000 + " с · " + reason);
+        report("failed", "Повтор через " + retryMs / 1000 + " с · " + reason);
         worker.postDelayed(this::open, retryMs);
         retryMs = Math.min(retryMs * 2, 30000);
     }
@@ -180,7 +202,13 @@ public final class MonitorService extends Service {
     @Override public void onDestroy() {
         destroyed = true;
         running = false;
-        if (started) status = "Наблюдение остановлено";
+        if (started) {
+            capture = "stopped";
+            captureHealth = null;
+            status = "Наблюдение остановлено";
+            calibrationPreview = null;
+            calibrationMotionAt = 0;
+        }
         worker.removeCallbacksAndMessages(null);
         worker.post(() -> {
             try {

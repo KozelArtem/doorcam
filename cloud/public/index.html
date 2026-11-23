@@ -17,16 +17,17 @@
     <noscript>Для просмотра видео включите JavaScript.</noscript>
   </section>
   <section id="dashboard" hidden>
-    <div class="title"><h1>Входная дверь</h1><span id="status" role="status">Подключение…</span></div>
+    <div class="title"><h1>Входная дверь</h1><div class="camera-state"><span id="status" role="status">Подключение…</span><span id="capture-status" role="status"></span></div></div>
     <div class="columns"><section class="monitor" aria-labelledby="screen-title">
       <div class="screen" data-mode="idle">
         <video id="video" muted playsinline preload="auto" controls aria-label="Видео с камеры"></video>
         <video id="video-buffer" muted playsinline preload="auto" controls aria-label="Видео с камеры" hidden></video>
         <div id="screen-idle"><span class="lens small" aria-hidden="true"><i></i></span><span id="screen-hint">Ожидание камеры</span></div>
       </div>
-      <div class="transport"><div><h2 id="screen-title" tabindex="-1">Прямой эфир</h2><span id="player-info" role="status"></span></div>
+      <div class="transport"><div><h2 id="screen-title" tabindex="-1">Прямой эфир</h2><span id="player-info" role="status"></span><span id="playback-info" role="status"></span></div>
         <button id="live" class="accent" disabled>Смотреть эфир</button>
         <button id="stop" hidden>Остановить</button>
+        <a id="download" class="download" download hidden>Скачать фрагмент</a>
       </div>
       <button id="back-to-recordings" hidden>К списку записей</button>
     </section>
@@ -42,6 +43,7 @@
       <div class="archive-list">
         <div id="recordings"></div>
         <button id="more" hidden>Показать ещё</button>
+        <button id="older" hidden>Загрузить более ранние записи</button>
       </div>
     </section></div>
   </section>

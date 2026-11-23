@@ -1,6 +1,6 @@
 export function eventFromUrl(search) {
   const id = new URLSearchParams(search).get('event');
-  return /^\d{1,16}$/.test(id ?? '') ? id : null;
+  return /^\d{1,15}$/.test(id ?? '') ? id : null;
 }
 export function dayKey(value) {
   const date = new Date(value);

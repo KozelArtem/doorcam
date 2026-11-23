@@ -46,6 +46,15 @@ function socket(info) {
     send(raw){this.frames.push(JSON.parse(raw));},close(code){this.code=code;}};
 }
 
+function videoForm(id, boxes = ['ftyp','moov','mdat'], offset = '0') {
+  const form = new FormData();
+  form.set('id',id);
+  form.set('offset',offset);
+  const headers = boxes.map(type => Buffer.concat([Buffer.of(0,0,0,16),Buffer.from(type),Buffer.from('00000000')]));
+  form.set('video',new Blob(headers,{type:'video/mp4'}),'event.mp4');
+  return form;
+}
+
 test('Mini App validation rejects spoofed, expired and unauthorized identities',async()=>{
   const {request,login} = fixture();
   for (const initData of [signed(41).replace('test_signature','edited'), signed(41,1000), signed(41)+'&user=%7B%22id%22%3A41%7D']) {
@@ -110,6 +119,155 @@ test('per-recipient event retries resume partial sends and deduplicate completio
   assert.deepEqual(attempts,['41','52','52']);
 });
 
+test('native Telegram video carries local capture time and refreshes the archive once',async(t)=>{
+  const {request,webhook,sockets} = fixture();
+  const viewer = socket({role:'viewer',id:'41'});
+  sockets.push(viewer);
+  let uploads = 0;
+  const id = String(Date.UTC(2026,10,23,13,22));
+  botStub(t, async(url,{body})=>{
+    if (!url.endsWith('/sendVideo')) return Response.json({ok:true});
+    uploads++;
+    assert.equal(body.get('video').type,'video/mp4');
+    assert.equal(body.get('supports_streaming'),'true');
+    assert.equal(body.get('chat_id'),'41');
+    assert.match(body.get('caption'),/23\.11\.2026.*16:22/);
+    assert.equal(JSON.parse(body.get('reply_markup')).inline_keyboard[0][0].web_app.url,origin+'/?event='+id);
+    return Response.json({ok:true});
+  });
+  await webhook(41,'/start');
+  function upload(bytes, offset = '180') {
+    const form = new FormData();
+    form.set('id',id);
+    form.set('offset',offset);
+    form.set('video',new Blob([bytes],{type:'video/mp4'}),'event.mp4');
+    return request('/api/event',{method:'POST',headers:{Authorization:'Bearer '+env.DEVICE_KEY},body:form});
+  }
+  const box = (type, data) => Buffer.concat([Buffer.of(0,0,0,data.length+8),Buffer.from(type),Buffer.from(data)]);
+  const video = Buffer.concat([box('ftyp','isom0000'),box('moov','meta'),box('mdat','clip')]);
+  assert.equal((await upload(video.subarray(0,-1))).status,400);
+  assert.equal((await upload(video,'999')).status,400);
+  assert.equal((await upload(video)).status,200);
+  assert.equal((await upload(video)).status,200);
+  assert.equal(uploads,1);
+  assert.deepEqual(viewer.frames,[{type:'event',id}]);
+});
+
+test('temporary Telegram failure does not consume a pending approval request',async(t)=>{
+  const {webhook} = fixture();
+  let attempts = 0;
+  botStub(t,(url,{body})=>{
+    if (JSON.parse(body).text.startsWith('Запрос доступа')) {
+      attempts++;
+      if (attempts === 1) return Response.json({ok:false,error_code:429});
+    }
+    return Response.json({ok:true});
+  });
+  assert.equal((await webhook(52,'/start')).status,503);
+  assert.equal((await webhook(52,'/start')).status,200);
+  assert.equal((await webhook(52,'/start',2)).status,200);
+  assert.equal(attempts,2);
+});
+
+test('completion replaces the original Telegram video once, including after a retry',async(t)=>{
+  const {request,webhook} = fixture();
+  const id = '1800000000000';
+  let sent = 0, edited = 0;
+  botStub(t,async(url,{body})=>{
+    if (url.endsWith('/sendVideo')) {
+      sent++;
+      return Response.json({ok:true,result:{message_id:17}});
+    }
+    if (url.endsWith('/editMessageMedia')) {
+      edited++;
+      assert.equal(body.get('chat_id'),'41');
+      assert.equal(body.get('message_id'),'17');
+      assert.equal(JSON.parse(body.get('media')).media,'attach://video');
+      if (edited===1) return Response.json({ok:false,error_code:429},{status:429});
+    }
+    return Response.json({ok:true,result:true});
+  });
+  await webhook(41,'/start');
+  async function upload(complete) {
+    const body=videoForm(id);
+    if (complete) body.set('phase','complete');
+    return (await request('/api/event',{method:'POST',headers:{Authorization:'Bearer '+env.DEVICE_KEY},body})).status;
+  }
+  assert.equal(await upload(false),200);
+  assert.equal(await upload(true),503);
+  assert.equal(await upload(true),200);
+  assert.equal(await upload(true),200);
+  assert.equal(sent,1);
+  assert.equal(edited,2);
+});
+
+test('a long recording edits the caption and preserves the full archive link',async(t)=>{
+  const {request,webhook} = fixture();
+  const id='1800000000000';
+  const captions=[];
+  botStub(t,async(url,{body})=>{
+    if (url.endsWith('/sendVideo')) return Response.json({ok:true,result:{message_id:17}});
+    if (url.endsWith('/editMessageCaption')) captions.push(JSON.parse(body));
+    assert.ok(!url.endsWith('/editMessageMedia'));
+    return Response.json({ok:true,result:true});
+  });
+  await webhook(41,'/start');
+  const upload=body=>request('/api/event',{method:'POST',headers:{Authorization:'Bearer '+env.DEVICE_KEY},body});
+  assert.equal((await upload(videoForm(id))).status,200);
+  const body=new FormData();
+  body.set('id',id);
+  body.set('phase','complete');
+  assert.equal((await upload(body)).status,200);
+  assert.equal(captions.length,1);
+  assert.equal(captions[0].message_id,17);
+  assert.equal(captions[0].reply_markup.inline_keyboard[0][0].web_app.url,origin+'/?event='+id);
+});
+
+test('permanent Telegram video rejection does not hold up the next event',async(t)=>{
+  const {request,webhook} = fixture();
+  const attempts = [];
+  const first = '1800000000000', next = '1800000020000';
+  botStub(t,async(url,{body})=>{
+    if (!url.endsWith('/sendVideo')) return Response.json({ok:true});
+    const id = new URL(JSON.parse(body.get('reply_markup')).inline_keyboard[0][0].web_app.url).searchParams.get('event');
+    const recipient = body.get('chat_id');
+    attempts.push([id,recipient]);
+    assert.equal(body.get('supports_streaming'),null);
+    if (id===first && recipient==='41') return Response.json({ok:false,error_code:400},{status:400});
+    return Response.json({ok:true});
+  });
+  await webhook(41,'/start');
+  await webhook(52,'/start');
+  await webhook(41,'/allow 52',2);
+  for (const id of [first,first,next]) {
+    const response = await request('/api/event',{method:'POST',headers:{Authorization:'Bearer '+env.DEVICE_KEY},
+      body:videoForm(id,['ftyp','mdat','moov'])});
+    assert.equal(response.status,200);
+  }
+  assert.deepEqual(attempts,[[first,'41'],[first,'52'],[next,'41'],[next,'52']]);
+});
+
+test('an in-flight request cannot mark a newer access decision as notified',async(t)=>{
+  const {webhook}=fixture();
+  let release, requestStarted;
+  const started=new Promise(resolve=>{requestStarted=resolve;});
+  let approvals=0;
+  botStub(t,async(_url,{body})=>{
+    const {text}=JSON.parse(body);
+    if (text.startsWith('Запрос доступа') && ++approvals===1) {
+      await new Promise(resolve=>{release=resolve; requestStarted();});
+    }
+    return Response.json({ok:true,result:true});
+  });
+  const first=webhook(52,'/start');
+  await started;
+  assert.equal((await webhook(41,'/revoke 52',20)).status,200);
+  release();
+  assert.equal((await first).status,200);
+  assert.equal((await webhook(52,'/start',2)).status,200);
+  assert.equal(approvals,2);
+});
+
 test('phone must authenticate before receiving offers and replaced socket goes offline',async()=>{
   const {hub,sockets}=fixture();
   const join = () => {
@@ -123,7 +281,7 @@ test('phone must authenticate before receiving offers and replaced socket goes o
   assert.equal(wrong.code,1008);
   const phone=join();
   await hub.webSocketMessage(phone,JSON.stringify({type:'auth',key:env.DEVICE_KEY}));
-  assert.deepEqual(phone.frames,[{type:'ready'}]);
+  assert.deepEqual(phone.frames,[{type:'ready',health:true}]);
   await hub.webSocketMessage(phone,'{"type":"ping"}');
   assert.deepEqual(phone.frames.pop(),{type:'pong'});
   assert.deepEqual(viewer.frames,[{type:'ready'}]);
@@ -151,6 +309,84 @@ test('logout rejects cross-origin POST and closes only the matching session',asy
   assert.equal(socketA.code,1008);
   assert.equal(socketB.code,undefined);
   assert.equal((await request('/api/me',{headers:{Cookie:cookie}})).status,401);
+});
+
+test('capture telemetry warns once after the grace period and reports recovery',async(t)=>{
+  t.mock.timers.enable({apis:['Date'],now:1_000_000});
+  const {hub,sockets}=fixture();
+  const notices=[];
+  botStub(t,async(url,{body})=>{
+    assert.ok(url.endsWith('/sendMessage'));
+    const message=JSON.parse(body);
+    assert.equal(message.chat_id,env.OWNER_ID);
+    notices.push(message.text);
+    return Response.json({ok:true,result:true});
+  });
+  const phone=socket({role:'device'});
+  const viewer=socket({role:'viewer',peer:'one',id:'41',expires:2_000_000});
+  sockets.push(phone,viewer);
+  const health=capture=>hub.webSocketMessage(phone,JSON.stringify({type:'health',capture}));
+  await health('ok');
+  assert.deepEqual(viewer.frames.at(-1),{type:'health',capture:'ok'});
+  t.mock.timers.tick(89_999);
+  await hub.alarm();
+  assert.equal(notices.length,0);
+  t.mock.timers.tick(1);
+  await hub.alarm();
+  await hub.alarm();
+  assert.equal(hub.captureStatus(),'offline');
+  assert.equal(notices.length,1);
+  await health('ok');
+  await hub.alarm();
+  assert.equal(notices.length,2);
+  await health('stopped');
+  t.mock.timers.tick(200_000);
+  await hub.alarm();
+  assert.equal(hub.captureStatus(),'stopped');
+  assert.equal(notices.length,2);
+});
+
+test('camera failure is reported even when its device remains connected',async(t)=>{
+  t.mock.timers.enable({apis:['Date'],now:1_000_000});
+  const {hub,sockets}=fixture();
+  const bot=botStub(t);
+  const phone=socket({role:'device'});
+  const viewer=socket({role:'viewer',peer:'one',id:'41',expires:2_000_000});
+  sockets.push(phone,viewer);
+  const health=capture=>hub.webSocketMessage(phone,JSON.stringify({type:'health',capture}));
+  await health('starting');
+  for (const capture of ['failed','starting','failed']) {
+    t.mock.timers.tick(30_000);
+    await health(capture);
+  }
+  await hub.alarm();
+  assert.equal(bot.mock.callCount(),0);
+  t.mock.timers.tick(30_000);
+  await health('failed');
+  await hub.alarm();
+  assert.equal(hub.captureStatus(),'failed');
+  assert.equal(bot.mock.callCount(),1);
+  t.mock.timers.tick(90_000);
+  await hub.alarm();
+  assert.deepEqual(viewer.frames.at(-1),{type:'health',capture:'offline'});
+  assert.equal(bot.mock.callCount(),1);
+});
+
+test('a replacement device republishes its capture state and manual stop survives disconnect',async()=>{
+  const {hub,sockets}=fixture();
+  const viewer=socket({role:'viewer',peer:'one',id:'41',expires:Date.now()+60_000});
+  const phone=socket({role:'device'});
+  sockets.push(viewer,phone);
+  const health=(ws,capture)=>hub.webSocketMessage(ws,JSON.stringify({type:'health',capture}));
+  await health(phone,'ok');
+  hub.webSocketClose(phone);
+  const replacement=socket({role:'device'});
+  sockets.push(replacement);
+  await health(replacement,'ok');
+  assert.deepEqual(viewer.frames.at(-1),{type:'health',capture:'ok'});
+  await health(replacement,'stopped');
+  hub.webSocketClose(replacement);
+  assert.deepEqual(viewer.frames.at(-1),{type:'health',capture:'stopped'});
 });
 
 test('OIDC binds browser state and PKCE, validates signed profile ID, nonce and claims',async(t)=>{

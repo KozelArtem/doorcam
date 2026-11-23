@@ -7,9 +7,9 @@ import {DoorPeer} from '../public/peer.js';
 const deviceScript = await readFile(new URL('../../android/app/src/main/assets/device.js', import.meta.url), 'utf8');
 const originalFetch = globalThis.fetch;
 async function until(predicate) {
-  const end = Date.now() + 3500;
+  const end = performance.now() + 3500;
   while (!predicate()) {
-    if (Date.now() > end) throw Error('Expected condition was not reached');
+    if (performance.now() > end) throw Error('Expected condition was not reached');
     await new Promise(resolve => setTimeout(resolve, 5));
   }
 }
@@ -18,22 +18,24 @@ function pair(t, buffered = false) {
   const held = new Map();
   const source = {
     live: false, present: false, growing: true, next: false, blocked: false,
-    reads: 0, requests: [], releases: [], subscribed: [],
+    reads: 0, requests: [], releases: [], subscribed: [], pages: [], expired: false, eventIds: [200,100],
   };
   const archive = {
     live(value) { source.subscribed.push(value); source.live = value; },
     connection(value) { source.present = value === 'online'; },
     requestIce(ticket) { queueMicrotask(() => device.ice(ticket, [])); },
     page(before) {
-      return JSON.stringify(!before
-        ? {events:[{id:'200',time:200,segments:1}], next:'200'}
-        : {events:[{id:'100',time:100,segments:2}], next:''});
+      source.pages.push(before);
+      const id = source.eventIds.find(value => !before || value < Number(before));
+      return JSON.stringify({events:id ? [{id:String(id),time:id,segments:1}] : [],
+        next:source.eventIds.some(value => value < id) ? String(id) : ''});
     },
     open(kind, id, after) {
       source.requests.push([kind, id, after]);
       let bytes, stamp;
       if (kind === 'preview') { bytes = [255,216,255,217]; stamp = id; }
       if (kind === 'segment') {
+        if (source.expired) return JSON.stringify({expired:true});
         if (!after) { bytes = [11,12,13]; stamp = '10'; }
         else if (after === '10' && source.next) { bytes = [21,22]; stamp = '20'; }
         else return JSON.stringify({growing:source.growing});
@@ -127,7 +129,7 @@ function pair(t, buffered = false) {
   });
   device = window.device;
   device.start('wss://camera.example/api/device','secret');
-  const statuses = [], archiveLists = [], modes = [];
+  const statuses = [], messages = [], archiveLists = [], modes = [], clips = [], health = [];
   const player = () => ({
     urls:[], ended:false, readyState:0,
     play() { this.ended = false; this.urls.push(this.src); return Promise.resolve(); },
@@ -137,9 +139,11 @@ function pair(t, buffered = false) {
   const video = player();
   const bufferVideo = buffered ? player() : undefined;
   const peer = new DoorPeer({video, bufferVideo, onArchive:e => archiveLists.push(e),
-    onStatus:state => statuses.push(state),onMode:mode => modes.push(mode)});
+    onStatus:state => statuses.push(state), onMode:mode => modes.push(mode),
+    onPlayback:message => messages.push(message), onClip:clip => clips.push(clip),
+    onHealth:capture => health.push(capture)});
   t.after(() => { peer.close(); phone.close(1008); });
-  return {peer,source,video,bufferVideo,held,statuses,archiveLists,modes,
+  return {peer,source,video,bufferVideo,held,statuses,archiveLists,modes,messages,clips,health,
     block(flag) {phoneChannel.bufferedAmount = flag ? 500000 : 0;},
     revoke() {viewer.close(1008);},
     notify(frame) {emit(viewer, frame);}
@@ -152,7 +156,7 @@ for (const buffered of [false, true]) {
     await until(() => source.present);
     peer.connect();
     await until(() => archiveLists.length);
-    assert.deepEqual(archiveLists[0].map(e => e.id), ['200','100']);
+    assert.deepEqual(archiveLists[0].map(e => e.id), ['200']);
     assert.deepEqual([...new Uint8Array(await (await peer.preview('100')).arrayBuffer())], [255,216,255,217]);
     peer.playEvent('100');
     await until(() => source.requests.some(r => r[0] === 'segment' && r[2] === '10'));
@@ -178,6 +182,78 @@ for (const buffered of [false, true]) {
     assert.ok(nextPlayer.src, 'keep the completed clip available to replay');
   });
 }
+
+test('the archive fetches later pages on demand and can play an event outside the first page', async t => {
+  const {peer,source,video,archiveLists} = pair(t);
+  await until(() => source.present);
+  peer.connect();
+  await until(() => archiveLists.length);
+  assert.deepEqual(source.pages, ['']);
+  peer.playEvent('100');
+  await until(() => video.src);
+  assert.deepEqual(source.pages, ['']);
+  await peer.list('older');
+  assert.deepEqual(archiveLists.at(-1).map(event => event.id), ['200','100']);
+  assert.deepEqual(source.pages, ['','200']);
+});
+
+test('background archive refresh bridges new pages without discarding loaded history', async t => {
+  const {peer,source,archiveLists} = pair(t);
+  await until(() => source.present);
+  peer.connect();
+  await until(() => archiveLists.length);
+  await peer.list('older');
+  source.eventIds = [400,300,200,100];
+  await peer.list('background');
+  assert.deepEqual(archiveLists.at(-1).map(event => event.id), ['400','300','200','100']);
+  assert.deepEqual(source.pages, ['','200','','400','300']);
+  source.eventIds.pop();
+  await peer.list('refresh');
+  assert.deepEqual(archiveLists.at(-1).map(event => event.id), ['400','300','200']);
+});
+
+test('explicit growing state survives a long wait and keeps the displayed archive clip downloadable', async t => {
+  const {peer,source,video,clips,messages} = pair(t);
+  await until(() => source.present);
+  peer.connect();
+  await until(() => peer.channel?.readyState === 'open');
+  peer.playEvent('100');
+  await until(() => source.requests.some(r => r[2] === '10'));
+  assert.deepEqual(clips.at(-1), {url:video.src, stamp:'10'});
+  video.finish();
+  t.mock.method(Date, 'now', () => Number.MAX_SAFE_INTEGER);
+  await until(() => peer.done || messages.includes('Запись продолжается'));
+  assert.equal(peer.done, false);
+  assert.equal(messages.at(-1), 'Запись продолжается');
+  source.next = true;
+  source.growing = false;
+  await until(() => video.urls.length === 2);
+  assert.deepEqual(clips.at(-1), {url:video.src, stamp:'20'});
+  peer.stop();
+  assert.equal(clips.at(-1), null);
+});
+
+test('an expired archive event is distinct from a growing recording', async t => {
+  const {peer,source,messages,archiveLists} = pair(t);
+  source.expired = true;
+  await until(() => source.present);
+  peer.connect();
+  await until(() => archiveLists.length);
+  peer.playEvent('100');
+  await until(() => source.requests.length);
+  await until(() => messages.includes('Запись удалена из архива.'));
+  assert.equal(source.requests.length, 1);
+});
+
+test('capture faults are reported separately from the viewer connection', async t => {
+  const {peer,source,statuses,notify,health} = pair(t);
+  await until(() => source.present);
+  peer.connect();
+  await until(() => statuses.at(-1) === 'online');
+  notify({type:'health',capture:'failed'});
+  await until(() => health.at(-1) === 'failed');
+  assert.equal(statuses.at(-1), 'online');
+});
 
 test('changing selection cancels a backpressured file; a revoked live viewer releases capture', async t => {
   const {peer,source,held,video,statuses,archiveLists,block,revoke} = pair(t);

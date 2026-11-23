@@ -5,7 +5,12 @@ import android.app.Activity;
 import android.content.*;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
+import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
 import android.graphics.Rect;
+import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
@@ -30,6 +35,11 @@ public final class MainActivity extends Activity {
     private Spinner cameras;
     private SeekBar sensitivity;
     private Button start, stop;
+    private CheckBox calibration;
+    private TextView calibrationStatus;
+    private ZonePreview zonePreview;
+    private MotionZone motionZone;
+    private byte[] displayedPreview;
     private final List<String> ids = new ArrayList<>();
     private final Handler ui = new Handler(Looper.getMainLooper());
     private ScheduledExecutorService resourceSampler;
@@ -53,6 +63,7 @@ public final class MainActivity extends Activity {
             limit.setEnabled(!active);
             origin.setEnabled(!active);
             key.setEnabled(!active);
+            if (calibration.isChecked()) refreshCalibration(active);
             ui.postDelayed(this, 750);
         }
     };
@@ -144,6 +155,7 @@ public final class MainActivity extends Activity {
             public void onStopTrackingTouch(SeekBar s) { }
         });
         add(recording, sensitivity, 0);
+        motionCalibration(recording);
         limit = field(recording, "Лимит видеоархива, МиБ", InputType.TYPE_CLASS_NUMBER,
                 String.valueOf(prefs.getInt("limit", 1024)));
 
@@ -157,6 +169,127 @@ public final class MainActivity extends Activity {
         key = field(remote, "Ключ устройства", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD,
                 prefs.getString("key", ""));
         key.setSaveEnabled(false);
+    }
+
+    private void motionCalibration(LinearLayout recording) {
+        motionZone = MotionZone.read(prefs);
+        calibration = new CheckBox(this);
+        calibration.setText("Настроить зону движения");
+        calibration.setMinHeight(dp(48));
+        add(recording, calibration, 8);
+        LinearLayout controls = column();
+        controls.setVisibility(View.GONE);
+        add(recording, controls, 4);
+
+        zonePreview = new ZonePreview();
+        controls.addView(zonePreview, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(180)));
+        calibrationStatus = label(controls, "", 14, R.color.doorcam_muted, 8);
+        String[] names = {"Левая граница", "Верхняя граница", "Правая граница", "Нижняя граница"};
+        int[] edges = {motionZone.left, motionZone.top, motionZone.right, motionZone.bottom};
+        SeekBar[] sliders = new SeekBar[edges.length];
+        for (int i = 0; i < edges.length; i++) {
+            int edge = i;
+            TextView caption = label(controls, names[i] + " · " + edges[i] + " %", 14, R.color.doorcam_muted, 8);
+            SeekBar slider = new SeekBar(this);
+            sliders[i] = slider;
+            slider.setId(View.generateViewId());
+            slider.setMinimumHeight(dp(48));
+            slider.setMax(100);
+            slider.setProgress(edges[i]);
+            caption.setLabelFor(slider.getId());
+            slider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                public void onProgressChanged(SeekBar bar, int progress, boolean fromUser) {
+                    if (fromUser) {
+                        int value = edge < 2 ? Math.min(progress, edges[edge + 2] - MotionZone.MIN_SIZE)
+                                : Math.max(progress, edges[edge - 2] + MotionZone.MIN_SIZE);
+                        if (value != progress) bar.setProgress(value);
+                        if (edges[edge] != value) {
+                            edges[edge] = value;
+                            applyMotionZone(new MotionZone(edges[0], edges[1], edges[2], edges[3]));
+                        }
+                    }
+                    caption.setText(names[edge] + " · " + bar.getProgress() + " %");
+                }
+                public void onStartTrackingTouch(SeekBar bar) { }
+                public void onStopTrackingTouch(SeekBar bar) { }
+            });
+            add(controls, slider, 0);
+        }
+        Button reset = new Button(this);
+        reset.setText("Весь кадр");
+        reset.setAllCaps(false);
+        reset.setMinHeight(dp(48));
+        reset.setOnClickListener(v -> {
+            for (int i = 0; i < edges.length; i++) {
+                edges[i] = i < 2 ? 0 : 100;
+                sliders[i].setProgress(edges[i]);
+            }
+            applyMotionZone(MotionZone.FULL);
+        });
+        add(controls, reset, 0);
+        calibration.setOnCheckedChangeListener((button, checked) -> {
+            controls.setVisibility(checked ? View.VISIBLE : View.GONE);
+            MonitorService.calibrationVisible = checked;
+            if (checked) refreshCalibration(MonitorService.running);
+            else clearCalibrationPreview();
+        });
+    }
+
+    private void applyMotionZone(MotionZone zone) {
+        motionZone = zone;
+        MonitorService.motionZone = zone;
+        MonitorService.calibrationMotionAt = 0;
+        zone.save(prefs);
+        zonePreview.invalidate();
+    }
+
+    private void refreshCalibration(boolean active) {
+        byte[] preview = active ? MonitorService.calibrationPreview : null;
+        if (displayedPreview != preview) {
+            displayedPreview = preview;
+            zonePreview.setImageBitmap(preview == null ? null : BitmapFactory.decodeByteArray(preview, 0, preview.length));
+        }
+        long latestMotion = MonitorService.calibrationMotionAt;
+        String text = !active ? "Начните наблюдение для предпросмотра" : preview == null ? "Ждём кадр с камеры…"
+                : latestMotion > 0 && SystemClock.elapsedRealtime() - latestMotion < 1800
+                ? "Движение в зоне" : "Движения в зоне нет";
+        if (!text.contentEquals(calibrationStatus.getText())) calibrationStatus.setText(text);
+    }
+
+    private void clearCalibrationPreview() {
+        MonitorService.calibrationPreview = null;
+        displayedPreview = null;
+        zonePreview.setImageDrawable(null);
+    }
+
+    private final class ZonePreview extends ImageView {
+        private final Paint outline = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF frame = new RectF();
+        private final RectF zone = new RectF();
+
+        ZonePreview() {
+            super(MainActivity.this);
+            setScaleType(ScaleType.FIT_CENTER);
+            setBackgroundColor(Color.BLACK);
+            setContentDescription("Предпросмотр камеры и границы зоны движения");
+            outline.setStyle(Paint.Style.STROKE);
+        }
+
+        @Override protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            if (getDrawable() == null) return;
+            frame.set(getDrawable().getBounds());
+            getImageMatrix().mapRect(frame);
+            float x = frame.width() / 100f, y = frame.height() / 100f;
+            zone.set(frame.left + motionZone.left * x, frame.top + motionZone.top * y,
+                    frame.left + motionZone.right * x, frame.top + motionZone.bottom * y);
+            outline.setColor(Color.BLACK);
+            outline.setStrokeWidth(dp(4));
+            canvas.drawRect(zone, outline);
+            outline.setColor(getColor(R.color.doorcam_accent));
+            outline.setStrokeWidth(dp(2));
+            canvas.drawRect(zone, outline);
+        }
     }
 
     private LinearLayout column() { LinearLayout l = new LinearLayout(this); l.setOrientation(LinearLayout.VERTICAL); return l; }
@@ -316,6 +449,7 @@ public final class MainActivity extends Activity {
     }
     @Override protected void onResume() {
         super.onResume();
+        MonitorService.calibrationVisible = calibration.isChecked();
         ui.post(refresh);
         resources.setText("ЦП — · RAM —");
         ResourceUsage usage = new ResourceUsage();
@@ -331,6 +465,8 @@ public final class MainActivity extends Activity {
 
     @Override protected void onPause() {
         ui.removeCallbacks(refresh);
+        MonitorService.calibrationVisible = false;
+        clearCalibrationPreview();
         resourceSampler.shutdownNow();
         resourceSampler = null;
         super.onPause();

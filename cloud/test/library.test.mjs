@@ -5,6 +5,7 @@ import { dayKey, eventFromUrl, groupDays } from '../public/library.mjs';
 test('notification target only accepts an event id', () => {
   assert.equal(eventFromUrl('?event=1733552046789'), '1733552046789');
   assert.equal(eventFromUrl('?event=../foo'), null);
+  assert.equal(eventFromUrl('?event=9999999999999999'), null);
 });
 test('local-day groups retain most recent recordings first across midnight', () => {
   const dates = [new Date(2026, 10, 22, 0, 1), new Date(2026, 10, 21, 23, 59), new Date(2026, 10, 22, 10)];

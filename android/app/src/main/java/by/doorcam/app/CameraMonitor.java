@@ -15,12 +15,12 @@ import android.media.ImageReader;
 import android.media.MediaRecorder;
 import android.os.Handler;
 import android.os.SystemClock;
+import android.util.Log;
 import android.util.Range;
 import android.util.Size;
 import android.view.Surface;
 import android.view.WindowManager;
 import java.io.ByteArrayOutputStream;
-import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
@@ -35,11 +35,28 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
     private final LiveMp4 live;
     private final State state;
     private final MotionDetector detector;
+    final CaptureHealth health = new CaptureHealth(SystemClock.elapsedRealtime());
     private final byte[] samples = new byte[SAMPLE_COLUMNS * SAMPLE_ROWS];
     private final long epoch = System.currentTimeMillis() - SystemClock.elapsedRealtime();
     private long previousFrame;
+    private long previousPreview;
     private int rotation;
-    private boolean closed;
+    private boolean closed, ready;
+    private final Runnable checkCapture = new Runnable() {
+        @Override public void run() {
+            if (closed) return;
+            String failure = health.failure(SystemClock.elapsedRealtime());
+            if (failure != null) {
+                failed(new IOException(failure));
+                return;
+            }
+            if (!ready && health.ready()) {
+                ready = true;
+                state.ready();
+            }
+            worker.postDelayed(this, 2_000);
+        }
+    };
     private CameraDevice camera;
     private CameraCaptureSession session;
     private ImageReader reader;
@@ -57,7 +74,8 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
 
     @Override public long now() { return epoch + SystemClock.elapsedRealtime(); }
     @Override public void segment(Archive.Segment segment, long end) throws IOException {
-        archive.finish(segment, end);
+        if (archive.finish(segment, end) && link != null) link.onEvent();
+        health.segment(SystemClock.elapsedRealtime());
     }
     @Override public void liveSegment(Archive.Segment segment, long end) throws IOException {
         if (link != null && link.wantsLive()) link.onSegment(archive.finishLive(segment, end));
@@ -80,6 +98,7 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
         reader.setOnImageAvailableListener(this::analyze, worker);
         encoder = new SegmentEncoder(rotation, this, live);
         Surface videoSurface = encoder.start(video, worker);
+        worker.postDelayed(checkCapture, 2_000);
         manager.openCamera(id, new CameraDevice.StateCallback() {
             @Override public void onOpened(CameraDevice device) {
                 if (closed) { device.close(); return; }
@@ -97,7 +116,6 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
                             session = configured;
                             try {
                                 configured.setRepeatingRequest(request.build(), null, worker);
-                                state.ready();
                             } catch (Exception e) { failed(e); }
                         }
                         @Override public void onConfigureFailed(CameraCaptureSession cfg) {
@@ -143,23 +161,35 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
             long now = now();
             if (image == null || now - previousFrame < 180) return;
             previousFrame = now;
+            long elapsed = SystemClock.elapsedRealtime();
+            health.frame(elapsed);
             Image.Plane y = image.getPlanes()[0];
             ByteBuffer buf = y.getBuffer();
             int width = image.getWidth(), height = image.getHeight();
             int rowStride = y.getRowStride(), pixelStride = y.getPixelStride();
             int base = buf.position(), sample = 0;
             for (int row = 0; row < SAMPLE_ROWS; row++) {
-                int offset = base + (row * height / SAMPLE_ROWS) * rowStride;
+                int offset = base + ((2 * row + 1) * height / (2 * SAMPLE_ROWS)) * rowStride;
                 for (int col = 0; col < SAMPLE_COLUMNS; col++) {
-                    samples[sample++] = buf.get(offset + (col * width / SAMPLE_COLUMNS) * pixelStride);
+                    int x = (2 * col + 1) * width / (2 * SAMPLE_COLUMNS);
+                    samples[sample++] = buf.get(offset + x * pixelStride);
                 }
             }
-            if (detector.observe(samples)) {
-                File pending = archive.motion(now, archive.needsPhoto(now) ? jpeg(image) : null);
-                if (pending != null) MonitorService.lastEvent = now;
-                if (pending != null && link != null) {
-                    String name = pending.getName();
-                    link.onEvent(name.substring(0, name.length() - 4), pending);
+            byte[] photo = null;
+            if (detector.observe(samples, SAMPLE_COLUMNS, SAMPLE_ROWS, rotation, MonitorService.motionZone)) {
+                MonitorService.calibrationMotionAt = elapsed;
+                if (archive.needsPhoto(now)) photo = jpeg(image);
+                if (archive.motion(now, photo)) {
+                    MonitorService.lastEvent = now;
+                    encoder.onMotion(now);
+                }
+            }
+            if (MonitorService.calibrationVisible && elapsed - previousPreview >= 1_000) {
+                previousPreview = elapsed;
+                try {
+                    MonitorService.calibrationPreview = photo != null ? photo : jpeg(image);
+                } catch (IOException e) {
+                    Log.w("Doorcam", "Предпросмотр зоны", e);
                 }
             }
         } catch (Exception error) { failed(error); }
@@ -202,9 +232,11 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
 
     @Override public void close() {
         closed = true;
+        worker.removeCallbacks(checkCapture);
         if (session != null) session.close();
         if (camera != null) camera.close();
         if (reader != null) reader.close();
         if (encoder != null) encoder.close();
+        if (archive.endCapture() && link != null) link.onEvent();
     }
 }

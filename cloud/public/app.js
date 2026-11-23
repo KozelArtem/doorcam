@@ -8,21 +8,27 @@ const timeLabel = new Intl.DateTimeFormat('ru', {hour:'2-digit',minute:'2-digit'
 const plurals = new Intl.PluralRules('ru');
 const mobile = matchMedia('(max-width: 760px)');
 const pageSize = 30;
-let peer, pendingEvent = eventFromUrl(location.search), events = [], selected = '';
+const linkedEvent = eventFromUrl(location.search);
+let peer, pendingEvent = linkedEvent, events = [], selected = '';
 let days = new Map(), archiveDay = '', visible = pageSize;
 let status = 'connecting', mode = 'idle', loadedArchive = false, generation = 0;
+let archiveCursor = '', archiveLoading = false, archiveRefresh;
 let observer, queue = [], inflight = 0;
-const urls = new Set();
+const previews = new Map();
 
 function gate(message, login = true, retry = false) {
   generation++;
   const old = peer;
   peer = null;
   old?.close();
-  resetPhotos();
+  clearTimeout(archiveRefresh);
+  resetPhotoQueue();
+  clearPreviews();
   events = [];
   days.clear();
   archiveDay = '';
+  archiveCursor = '';
+  archiveLoading = false;
   visible = pageSize;
   selected = '';
   loadedArchive = false;
@@ -35,11 +41,19 @@ function gate(message, login = true, retry = false) {
   el('retry').hidden = !retry;
   el('gate-message').textContent = message;
 }
-function resetPhotos() {
+function resetPhotoQueue() {
   observer?.disconnect();
   queue = [];
-  for (const url of urls) URL.revokeObjectURL(url);
-  urls.clear();
+}
+function clearPreviews() {
+  for (const url of previews.values()) URL.revokeObjectURL(url);
+  previews.clear();
+}
+function showPreview(target, url) {
+  const img = new Image();
+  img.alt = '';
+  img.src = url;
+  target.replaceChildren(img);
 }
 async function photos() {
   if (!peer || status !== 'online' || mode !== 'idle' || inflight) return;
@@ -50,11 +64,14 @@ async function photos() {
   try {
     const blob = await connection.preview(target.dataset.id);
     if (peer === connection && target.isConnected && blob?.size) {
-      const img = new Image();
-      img.alt = '';
-      img.src = URL.createObjectURL(blob);
-      urls.add(img.src);
-      target.replaceChildren(img);
+      if (previews.size >= 90) {
+        const oldest = previews.keys().next().value;
+        URL.revokeObjectURL(previews.get(oldest));
+        previews.delete(oldest);
+      }
+      const url = URL.createObjectURL(blob);
+      previews.set(target.dataset.id, url);
+      showPreview(target, url);
     }
   } catch {
     if (peer === connection && mode !== 'idle' && target.isConnected) queue.unshift(target);
@@ -100,7 +117,7 @@ function showDay(day) {
   document.querySelector('.archive-list').scrollTop = 0;
 }
 function list() {
-  resetPhotos();
+  resetPhotoQueue();
   const container = el('recordings');
   container.replaceChildren();
   const [today, yesterday] = recentDays();
@@ -116,11 +133,14 @@ function list() {
   el('yesterday').setAttribute('aria-pressed', String(day === yesterday));
   document.querySelector('.archive-filters').hidden = !loadedArchive;
   el('more').hidden = group.length <= visible;
+  el('older').hidden = !archiveCursor;
+  el('older').disabled = status !== 'online' || archiveLoading;
   const summary = el('archive-summary');
   summary.hidden = !group.length;
   const notice = el('archive-status');
   notice.textContent = !loadedArchive ? 'Ожидание архива на телефоне…' :
-    !events.length ? 'Записей пока нет.' : !group.length ? 'За этот день записей нет.' : '';
+    !events.length ? 'Записей пока нет.' : !group.length ?
+    (archiveCursor ? 'Среди загруженных записей за этот день ничего нет.' : 'За этот день записей нет.') : '';
   if (!group.length) return;
   const time = group[0].time;
   const label = day === today ? `Сегодня, ${shortDate.format(time)}` :
@@ -130,7 +150,7 @@ function list() {
   summary.textContent = `${label} · ${count} ${noun}`;
   if ('IntersectionObserver' in window) {
     observer = new IntersectionObserver(items => {
-      for (const item of items) if (item.isIntersecting) {
+      for (const item of items) if (item.isIntersecting && item.target.isConnected) {
         observer.unobserve(item.target);
         queue.push(item.target);
       }
@@ -158,8 +178,40 @@ function list() {
     row.append(thumb,time,current);
     markClip(row);
     container.append(row);
-    observer?.observe(thumb);
+    const saved = previews.get(id);
+    if (saved) showPreview(thumb, saved);
+    else observer?.observe(thumb);
   }
+}
+async function loadArchive(mode) {
+  if (!peer || status !== 'online' || archiveLoading) return;
+  archiveLoading = true;
+  el('refresh').disabled = el('older').disabled = true;
+  const connection = peer;
+  try {
+    await connection.list(mode);
+  } finally {
+    if (peer === connection) {
+      archiveLoading = false;
+      el('refresh').disabled = el('older').disabled = status !== 'online';
+    }
+  }
+}
+function refreshLatest() {
+  clearTimeout(archiveRefresh);
+  if (document.hidden) return;
+  archiveRefresh = setTimeout(() => {
+    if (archiveLoading) refreshLatest();
+    else void loadArchive('background');
+  }, 300);
+}
+function showDownload(clip) {
+  const link = el('download');
+  link.hidden = !clip;
+  if (clip) {
+    link.href = clip.url;
+    link.download = `doorcam-${selected}-${clip.stamp}.mp4`;
+  } else link.removeAttribute('href');
 }
 function displayMode(next) {
   mode = next;
@@ -187,19 +239,34 @@ function openCamera() {
   el('logout').hidden = false;
   el('dashboard').hidden = false;
   const current = () => generation === run;
+  el('capture-status').textContent = el('playback-info').textContent = '';
+  showDownload(null);
   displayMode('idle');
   list();
   peer = new DoorPeer({
     video: el('video'),
     bufferVideo: el('video-buffer'),
     onMode(next) { if (current()) displayMode(next); },
+    onClip(clip) { if (current()) showDownload(clip); },
+    onPlayback(message) {
+      if (current() && el('playback-info').textContent !== message) el('playback-info').textContent = message;
+    },
+    onHealth(capture) {
+      if (!current()) return;
+      const labels = {ok:'Захват работает', starting:'Камера запускается', failed:'Ошибка захвата',
+        stopped:'Наблюдение остановлено', offline:'Нет данных о захвате'};
+      const message = Object.hasOwn(labels, capture) ? labels[capture] : '';
+      if (el('capture-status').textContent !== message) el('capture-status').textContent = message;
+    },
+    onEvent() { if (current()) refreshLatest(); },
     onStatus(state, message) {
       if (!current()) return;
       status = state;
       const labels = {online:'Камера на связи', offline:'Камера вне сети', connecting:'Подключение…', error:'Ошибка связи'};
       el('status').textContent = labels[state] ?? 'Проверка доступа';
       el('status').dataset.state = state;
-      el('refresh').disabled = el('live').disabled = state !== 'online';
+      el('live').disabled = state !== 'online';
+      el('refresh').disabled = el('older').disabled = state !== 'online' || archiveLoading;
       el('screen-hint').textContent = state === 'online' ? 'Камера готова к просмотру' : message || labels[state];
       if (message && state !== 'connecting') el('player-info').textContent = message;
       if (state === 'unauthorized') return gate('Для просмотра нужен действующий доступ. Открой чат с ботом или войди снова.');
@@ -211,13 +278,13 @@ function openCamera() {
         });
       }
     },
-    onArchive(incoming) {
+    onArchive(incoming, next) {
       if (!current()) return;
-      const first = !loadedArchive;
       events = incoming;
       days = groupDays(events);
+      archiveCursor = next;
       loadedArchive = true;
-      if (first && selected) revealSelectedDay();
+      if (selected && linkedEvent === selected && !archiveDay) revealSelectedDay();
       list();
     }
   });
@@ -253,14 +320,16 @@ el('live').onclick = () => {
   peer?.live();
 };
 el('stop').onclick = () => peer?.stop();
-el('refresh').onclick = () => peer?.list();
+el('refresh').onclick = () => loadArchive();
+el('older').onclick = () => loadArchive('older');
 el('today').onclick = () => showDay(recentDays()[0]);
 el('yesterday').onclick = () => showDay(recentDays()[1]);
 el('archive-date').onchange = e => showDay(e.target.value);
 el('back-to-recordings').onclick = () => {
   if (revealSelectedDay()) list();
   const row = el('recordings').querySelector('[aria-current=true]');
-  const target = row ?? (loadedArchive ? el('today') : el('refresh'));
+  const older = el('older');
+  const target = row ?? (archiveCursor && !older.disabled ? older : el(loadedArchive ? 'today' : 'refresh'));
   target.scrollIntoView({block:'center'});
   target.focus({preventScroll:true});
 };
@@ -278,6 +347,13 @@ el('logout').onclick = async () => {
     gate('Ты вышел из аккаунта.');
   } catch { el('player-info').textContent = 'Не удалось выйти. Проверь соединение.'; }
 };
-window.addEventListener('pagehide', () => { generation++; peer?.close(); resetPhotos(); });
+document.addEventListener('visibilitychange', refreshLatest);
+window.addEventListener('pagehide', () => {
+  generation++;
+  clearTimeout(archiveRefresh);
+  peer?.close();
+  resetPhotoQueue();
+  clearPreviews();
+});
 window.addEventListener('pageshow', e => { if (e.persisted) void login(); });
 void login();

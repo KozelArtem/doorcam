@@ -11,6 +11,7 @@
   button, select { font: inherit; min-height: 2.75rem; padding: .35rem .6rem; max-width: 100%; }
   .row { display: flex; flex-wrap: wrap; align-items: center; gap: .65rem; margin: .6rem 0; }
   .row[hidden] { display: none; }
+  #download:not([hidden]) { display: inline-flex; align-items: center; min-height: 2.75rem; }
   #stage { position: relative; overflow: hidden; height: min(62vh, 34rem); background: #131a18; border-radius: .65rem; }
   #live { position: absolute; top: 50%; left: 50%; }
   #recording { display: block; width: 100%; height: 65vh; object-fit: contain; background: #131a18; border-radius: .65rem; }
@@ -41,6 +42,7 @@
       <label for="clips">Фрагмент</label>
       <select id="clips"></select>
     </div>
+    <a id="download" download hidden>Скачать фрагмент MP4</a>
     <p id="archive-status" role="status"></p>
     <video id="recording" controls playsinline preload="metadata" aria-label="Запись движения" hidden></video>
   </section>

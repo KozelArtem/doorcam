@@ -3,7 +3,9 @@ package by.doorcam.app;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaCodecList;
+import android.media.MediaExtractor;
 import android.media.MediaFormat;
+import android.media.MediaMetadataRetriever;
 import android.media.MediaMuxer;
 import android.os.Build;
 import android.os.Handler;
@@ -38,7 +40,7 @@ final class SegmentEncoder implements AutoCloseable {
     }
 
     private List<Sample> samples;
-    private long startMs, liveStartMs;
+    private long startMs, liveStartMs, motionStartMs = Long.MIN_VALUE;
     private int liveIndex;
     private int bytes;
 
@@ -102,12 +104,20 @@ final class SegmentEncoder implements AutoCloseable {
         return surface;
     }
 
+    void onMotion(long now) { motionStartMs = now; }
+
+    static boolean archiveBoundary(long durationUs, long now, long onset) {
+        // Keep the start of a visit in one MP4 if it falls just before a regular cut.
+        return durationUs >= 10_000_000L && (durationUs >= 11_750_000L || onset < now - 750);
+    }
+
     private void write(ByteBuffer buffer, MediaCodec.BufferInfo info) throws IOException {
         if (buffer == null || info.size == 0 || (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) return;
         boolean sync = (info.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0;
         if (sync && outputFormat != null) {
             long pts = info.presentationTimeUs;
-            boolean archiveBoundary = samples == null || pts - samples.get(0).pts >= 10_000_000L;
+            boolean archiveBoundary = samples == null ||
+                    archiveBoundary(pts - samples.get(0).pts, listener.now(), motionStartMs);
             if (samples != null && (archiveBoundary || pts - samples.get(liveIndex).pts >= 750_000L)) {
                 publish(samples.subList(liveIndex, samples.size()), liveStartMs, true);
                 liveStartMs = listener.now();
@@ -143,6 +153,60 @@ final class SegmentEncoder implements AutoCloseable {
             for (Sample s : samples) {
                 info.set(0, s.data.length, s.pts - first, s.flags);
                 mux.writeSampleData(track, ByteBuffer.wrap(s.data), info);
+            }
+            mux.stop();
+        } finally { mux.release(); }
+    }
+
+    static void join(File destination, List<File> clips) throws IOException {
+        long bytes = 0;
+        for (File clip : clips) {
+            long length = clip.length();
+            if (length == 0) throw new IOException("Фрагмент отсутствует в архиве");
+            bytes += length;
+            if (bytes > Archive.TELEGRAM_COMPLETE_BYTES) throw new IOException("Запись слишком большая для Telegram");
+        }
+        if (destination.getUsableSpace() - Archive.FREE_RESERVE < bytes)
+            throw new IOException("Недостаточно памяти для сборки записи");
+        MediaMetadataRetriever metadata = new MediaMetadataRetriever();
+        int rotation;
+        try {
+            metadata.setDataSource(clips.get(0).getPath());
+            String value = metadata.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION);
+            rotation = value == null ? 0 : Integer.parseInt(value);
+        } finally { metadata.release(); }
+        MediaMuxer mux = new MediaMuxer(destination.getPath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+        try {
+            mux.setOrientationHint(rotation);
+            ByteBuffer buffer = ByteBuffer.allocate(4 * 1024 * 1024);
+            MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+            long offset = 0;
+            int track = -1;
+            for (File clip : clips) {
+                if (Thread.currentThread().isInterrupted()) throw new IOException("Сборка видео прервана");
+                MediaExtractor input = new MediaExtractor();
+                try {
+                    input.setDataSource(clip.getPath());
+                    MediaFormat format = input.getTrackFormat(0);
+                    input.selectTrack(0);
+                    if (track < 0) {
+                        track = mux.addTrack(format);
+                        mux.start();
+                    }
+                    long first = input.getSampleTime(), last = 0;
+                    if (first < 0) throw new IOException("Фрагмент не содержит видео");
+                    for (int size; (size = input.readSampleData(buffer, 0)) >= 0; input.advance()) {
+                        long time = input.getSampleTime() - first;
+                        int flags = (input.getSampleFlags() & MediaExtractor.SAMPLE_FLAG_SYNC) != 0
+                                ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0;
+                        info.set(0, size, offset + time, flags);
+                        mux.writeSampleData(track, buffer, info);
+                        last = Math.max(last, time);
+                        buffer.clear();
+                    }
+                    offset += Math.max(last + 1, format.containsKey(MediaFormat.KEY_DURATION)
+                            ? format.getLong(MediaFormat.KEY_DURATION) : last + 66_667);
+                } finally { input.release(); }
             }
             mux.stop();
         } finally { mux.release(); }

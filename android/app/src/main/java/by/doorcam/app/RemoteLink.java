@@ -28,7 +28,11 @@ import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.time.Instant;
+import java.time.ZoneId;
 import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Map;
@@ -49,6 +53,7 @@ public final class RemoteLink {
     private final Context context;
     private final String origin, key;
     private final File archive, live, outbox;
+    private final Archive recordings;
     private final Handler main = new Handler(Looper.getMainLooper());
     private WebView view;
     private Bridge bridge;
@@ -65,11 +70,12 @@ public final class RemoteLink {
     private ScheduledFuture<?> nextUpload;
     private int backoff;
 
-    public RemoteLink(Context context, String origin, String key, File archiveDir) {
+    RemoteLink(Context context, String origin, String key, Archive recordings) {
         this.context = context.getApplicationContext();
         this.origin = cleanOrigin(origin);
         this.key = key == null ? "" : key.trim();
-        this.archive = archiveDir;
+        this.recordings = recordings;
+        this.archive = recordings.archiveDir;
         this.live = new File(context.getFilesDir(), "live");
         this.outbox = new File(context.getFilesDir(), "outbox");
     }
@@ -106,7 +112,12 @@ public final class RemoteLink {
             status("stopped");
             if (uploads != null) uploads.shutdownNow();
             uploads = null;
-            unmount();
+            WebView closing = view;
+            if (closing == null) return;
+            Runnable release = () -> { if (view == closing) unmount(); };
+            // Allow the WebSocket close handshake to send the final capture state.
+            closing.evaluateJavascript("window.device && device.stop()", ignored -> main.postDelayed(release, 500));
+            main.postDelayed(release, 1500);
         });
     }
 
@@ -117,8 +128,8 @@ public final class RemoteLink {
                 .edit().putString("status", status).apply();
     }
 
-    /** Camera atomically places the completed JPEG in outbox before invoking this method. */
-    public void onEvent(String eventId, File jpeg) {
+    /** Camera adds the completed video to the outbox before invoking this method. */
+    public void onEvent() {
         main.post(() -> {
             if (started && backoff == 0) scheduleUpload(0);
         });
@@ -215,23 +226,28 @@ public final class RemoteLink {
         ScheduledThreadPoolExecutor owner = uploads;
         nextUpload = owner.schedule(() -> {
             boolean ok = true;
-            File[] pending = outbox.listFiles((d, name) -> name.matches("[0-9]{1,15}\\.jpg"));
+            File[] pending = outbox.listFiles((d, name) -> name.matches("[0-9]{1,15}\\.(mp4|jpg|done)"));
             if (pending != null) {
-                Arrays.sort(pending, BY_NEWEST.reversed());
+                Arrays.sort(pending, Comparator.comparing((File file) -> file.getName().endsWith(".done"))
+                        .thenComparing(BY_NEWEST.reversed()));
                 for (File file : pending) {
                     if (Thread.currentThread().isInterrupted()) return;
+                    if (!file.isFile()) continue;
+                    boolean complete = file.getName().endsWith(".done");
                     try {
-                        int code = upload(file);
+                        if (complete && new File(outbox, stamp(file) + ".mp4").isFile()) continue;
+                        int code = complete ? uploadCompletion(file) : upload(stamp(file), file, false);
                         if (code >= 200 && code < 300) {
                             if (!file.delete() && file.exists()) ok = false;
                         } else {
                             ok = false;
-                            // Skip a rejected JPEG so other pending events can still arrive.
-                            if (code != 400 && code != 413 && code != 415) break;
+                            // Skip rejected media so other pending events can still arrive.
+                            if (!complete && code != 400 && code != 413 && code != 415) break;
                         }
                     } catch (IOException | RuntimeException e) {
+                        if (!file.exists()) continue; // The archive evicted this event.
                         ok = false;
-                        break;
+                        if (!complete) break;
                     }
                 }
             }
@@ -245,24 +261,59 @@ public final class RemoteLink {
         }, seconds, TimeUnit.SECONDS);
     }
 
-    private int upload(File jpeg) throws IOException {
+    private int uploadCompletion(File marker) throws IOException {
+        long id = stamp(marker);
+        ArrayList<File> clips = new ArrayList<>();
+        File event = new File(archive, Long.toString(id));
+        for (String name : Files.readAllLines(marker.toPath(), StandardCharsets.US_ASCII)) {
+            if (!name.matches("[0-9]{1,15}\\.mp4")) throw new IOException("Неверное имя фрагмента");
+            clips.add(new File(event, name));
+        }
+        if (clips.isEmpty()) return upload(id, null, true);
+        File joined = null;
+        try {
+            try {
+                joined = Files.createTempFile(outbox.toPath(), id + ".", ".part").toFile();
+                SegmentEncoder.join(joined, clips);
+            } catch (IOException | RuntimeException e) {
+                if (Thread.currentThread().isInterrupted() || !marker.isFile()) throw new IOException(e);
+                Log.w("Doorcam", "Не удалось собрать полное видео для Telegram", e);
+                return upload(id, null, true);
+            }
+            if (joined.length() > Archive.TELEGRAM_COMPLETE_BYTES) return upload(id, null, true);
+            int code = upload(id, joined, true);
+            return code == 400 || code == 413 || code == 415 ? upload(id, null, true) : code;
+        } finally {
+            if (joined != null) Files.deleteIfExists(joined.toPath());
+        }
+    }
+
+    private int upload(long eventId, File media, boolean complete) throws IOException {
         String boundary = "doorcam-" + UUID.randomUUID();
+        int offset = ZoneId.systemDefault().getRules().getOffset(Instant.ofEpochMilli(eventId)).getTotalSeconds() / 60;
+        boolean video = complete || media != null && media.getName().endsWith(".mp4");
+        String extension = video ? ".mp4" : ".jpg";
+        String part = video ? "video" : "photo";
+        String mime = video ? "video/mp4" : "image/jpeg";
         byte[] header = ("--" + boundary + "\r\nContent-Disposition: form-data; name=\"id\"\r\n\r\n"
-                + stamp(jpeg) + "\r\n--" + boundary
-                + "\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"event.jpg\"\r\n"
-                + "Content-Type: image/jpeg\r\n\r\n").getBytes(StandardCharsets.US_ASCII);
+                + eventId + "\r\n--" + boundary + "\r\nContent-Disposition: form-data; name=\"offset\"\r\n\r\n"
+                + offset + (complete ? "\r\n--" + boundary + "\r\nContent-Disposition: form-data; name=\"phase\"\r\n\r\ncomplete" : "")
+                + (media == null ? "" : "\r\n--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + part
+                + "\"; filename=\"event" + extension + "\"\r\nContent-Type: " + mime + "\r\n\r\n")).getBytes(StandardCharsets.US_ASCII);
         byte[] footer = ("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.US_ASCII);
         HttpURLConnection c = connect("/api/event");
-        try (FileInputStream input = new FileInputStream(jpeg)) {
+        try (FileInputStream input = media == null ? null : new FileInputStream(media)) {
             c.setRequestMethod("POST");
             c.setDoOutput(true);
             c.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
-            c.setFixedLengthStreamingMode(header.length + jpeg.length() + footer.length);
+            c.setFixedLengthStreamingMode(header.length + (input == null ? 0 : input.getChannel().size()) + footer.length);
             try (OutputStream out = c.getOutputStream()) {
                 out.write(header);
-                byte[] chunk = new byte[8192];
-                int read;
-                while ((read = input.read(chunk)) != -1) out.write(chunk, 0, read);
+                if (input != null) {
+                    byte[] chunk = new byte[8192];
+                    int read;
+                    while ((read = input.read(chunk)) != -1) out.write(chunk, 0, read);
+                }
                 out.write(footer);
             }
             return c.getResponseCode();
@@ -291,6 +342,8 @@ public final class RemoteLink {
         private boolean closed;
 
         Bridge(WebView owner) { this.owner = owner; }
+
+        @JavascriptInterface public String captureState() { return MonitorService.captureState(); }
 
         @JavascriptInterface public synchronized void live(boolean needed) {
             if (!closed) liveRequested = needed;
@@ -359,13 +412,14 @@ public final class RemoteLink {
                 boolean current = "live".equals(kind);
                 if (!current && !eventId.matches("[0-9]{1,15}")) return "";
                 File dir = current ? live : new File(archive, eventId);
-                if (!current && !dir.isDirectory()) return "";
+            if (!current && !dir.isDirectory()) return "{\"expired\":true}";
                 File file;
                 if ("preview".equals(kind)) {
                     file = new File(dir, "preview.jpg");
                 } else if (current || "segment".equals(kind)) {
                     long cursor = after.isEmpty() ? 0 : Long.parseLong(after);
                     if (current) cursor = Math.max(cursor, System.currentTimeMillis() - 20000);
+                boolean growing = !current && recordings.isGrowing(eventId);
                     file = null;
                     for (File candidate : segments(dir)) {
                         long t = stamp(candidate);
@@ -374,9 +428,7 @@ public final class RemoteLink {
                     }
                     if (file == null) {
                         if (current) return "{}";
-                        long newest = cursor == 0 ? Long.parseLong(eventId) : cursor;
-                        long age = System.currentTimeMillis() - newest;
-                        return age >= -10000 && age <= 10000 ? "{\"growing\":true}" : "{}";
+                        return growing ? "{\"growing\":true}" : "{}";
                     }
                 } else return "";
                 long size = file.length();

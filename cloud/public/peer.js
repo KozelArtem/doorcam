@@ -22,13 +22,18 @@ export class FileBody {
 }
 
 export class DoorPeer {
-  constructor({video, bufferVideo, onStatus = () => {}, onMode = () => {}, onArchive = () => {}}) {
+  constructor({video, bufferVideo, onStatus = () => {}, onMode = () => {}, onArchive = () => {},
+    onPlayback = () => {}, onClip = () => {}, onHealth = () => {}, onEvent = () => {}}) {
     this.video = video;
     this.bufferVideo = bufferVideo;
     this.activeVideo = video;
     this.onStatus = onStatus;
     this.onMode = onMode;
     this.onArchive = onArchive;
+    this.onPlayback = onPlayback;
+    this.onClip = onClip;
+    this.onHealth = onHealth;
+    this.onEvent = onEvent;
     this.pending = new Map();
     this.sequence = 0;
     this.connection = 0;
@@ -37,6 +42,8 @@ export class DoorPeer {
     this.queue = [];
     this.delay = 1000;
     this.listVersion = 0;
+    this.archiveEvents = [];
+    this.archiveCursor = '';
     const failPlayback = () => {
       this.stop();
       this.onStatus('online', 'Браузер не смог воспроизвести этот видеофайл.');
@@ -68,9 +75,14 @@ export class DoorPeer {
       try { frame = JSON.parse(e.data); } catch { return ws.close(); }
       if (frame.type === 'offline') {
         this.resetPeer();
+        this.onHealth('offline');
         this.onStatus('offline', 'Телефон вне сети. Подключение восстановится автоматически.');
       } else if (frame.type === 'ready') {
         this.negotiate(ws);
+      } else if (frame.type === 'health') {
+        this.onHealth(frame.capture);
+      } else if (frame.type === 'event') {
+        this.onEvent(frame.id);
       } else if (frame.type === 'answer' || frame.type === 'ice') {
         const pc = this.pc;
         if (!pc) return;
@@ -87,6 +99,7 @@ export class DoorPeer {
       if (this.socket !== ws) return;
       this.socket = null;
       this.resetPeer();
+      this.onHealth('offline');
       const token = this.connection;
       let denied = event.code === 1008;
       // Browsers mask the HTTP status of a failed upgrade. Recheck the session after a drop.
@@ -247,19 +260,35 @@ export class DoorPeer {
     else p.resolve(value);
   }
 
-  async list() {
+  async list(mode = 'refresh') {
+    const older = mode === 'older';
+    const before = older ? this.archiveCursor : '';
+    if (older && !before) return;
     const version = ++this.listVersion;
-    const events = [];
-    let before = '';
+    const keepCached = mode === 'background';
+    const boundary = older ? NaN : Number((keepCached ? this.archiveEvents[0] : this.archiveEvents.at(-1))?.id);
     try {
+      const events = [];
+      let next = before;
       do {
-        const result = await this.request({op:'list', before});
+        const cursor = next;
+        const page = await this.request({op:'list', before:cursor});
         if (version !== this.listVersion) return;
-        events.push(...result.events);
-        if (result.next && before && Number(result.next) >= Number(before)) throw Error();
-        before = result.next;
-      } while (before);
-      this.onArchive(events);
+        next = page.next;
+        if (next && (!/^\d{1,15}$/.test(next) || (cursor && Number(next) >= Number(cursor)))) throw Error();
+        events.push(...page.events);
+      } while (next && Number(next) > boundary);
+      if (keepCached && next) {
+        // Bridge any gap before retaining the part of the archive already loaded by the viewer.
+        const retained = this.archiveEvents.filter(event => Number(event.id) < Number(next));
+        if (retained.length) {
+          events.push(...retained);
+          next = this.archiveCursor;
+        }
+      }
+      this.archiveEvents = older ? this.archiveEvents.concat(events) : events;
+      this.archiveCursor = next;
+      this.onArchive(this.archiveEvents, next);
     } catch {
       if (version === this.listVersion) this.onStatus('online', 'Не удалось прочитать список записей.');
     }
@@ -271,7 +300,7 @@ export class DoorPeer {
   }
 
   live() { this.requested = {op:'live'}; this.beginMedia(); }
-  playEvent(id) { this.requested = {op:'segment', id:String(id)}; this.beginMedia(); }
+  playEvent(id) { this.requested = {op:'segment', id:String(id), states:true}; this.beginMedia(); }
   stop() { this.requested = {op:'idle'}; this.clearMedia(); }
 
   clearMedia(notify = true) {
@@ -299,6 +328,8 @@ export class DoorPeer {
     this.activeVideo = this.video;
     this.video.hidden = false;
     if (this.bufferVideo) this.bufferVideo.hidden = true;
+    this.onClip(null);
+    this.onPlayback('');
     if (notify) this.onMode('idle');
   }
 
@@ -323,23 +354,32 @@ export class DoorPeer {
       const file = await this.request({...this.requested, after: this.after}, true);
       if (token !== this.media) return;
       this.fetching = false;
+      if (file?.expired) {
+        if (!this.displayed) this.stop();
+        this.done = true;
+        this.onPlayback('Запись удалена из архива.');
+        return;
+      }
       if (!file || file.growing) {
         // A Telegram notification can arrive before the first MP4 has been finalized.
-        if (this.requested.op === 'live' || ((file?.growing || !this.after) && Date.now() - this.lastSegment < 12000)) {
-          const interval = this.requested.op === 'live' ? 300 : 700;
+        const live = this.requested.op === 'live';
+        if (live || file?.growing || (!this.after && Date.now() - this.lastSegment < 12000)) {
+          if (file?.growing && (!this.displayed || this.activeVideo.ended)) this.onPlayback('Запись продолжается');
+          const interval = live ? 300 : 700;
           this.nextPoll = setTimeout(() => { this.nextPoll = null; void this.fill(); }, interval);
         } else {
           this.done = true;
+          this.onPlayback('');
           if (!this.displayed) {
             this.stop();
-            this.onStatus('online', 'В записи пока нет видео.');
+            this.onPlayback('В записи пока нет видео.');
           }
         }
         return;
       }
       this.lastSegment = Date.now();
       this.after = String(file.stamp);
-      this.queue.push(file.blob);
+      this.queue.push(file);
       if (this.currentUrl) this.stageNext();
       if (!this.currentUrl || this.activeVideo.ended) this.advance();
     } catch (e) {
@@ -361,7 +401,7 @@ export class DoorPeer {
   stageNext() {
     if (!this.bufferVideo || this.staged || !this.queue.length) return;
     const player = this.activeVideo === this.video ? this.bufferVideo : this.video;
-    const url = URL.createObjectURL(this.queue[0]);
+    const url = URL.createObjectURL(this.queue[0].blob);
     const staged = {player, url};
     this.staged = staged;
     player.oncanplay = () => {
@@ -381,7 +421,7 @@ export class DoorPeer {
     const previousPlayer = this.activeVideo;
     const previousUrl = this.currentUrl;
     this.activeVideo = this.staged?.player ?? previousPlayer;
-    this.currentUrl = this.staged?.url ?? URL.createObjectURL(next);
+    this.currentUrl = this.staged?.url ?? URL.createObjectURL(next.blob);
     this.activeVideo.oncanplay = null;
     if (!this.staged) this.activeVideo.src = this.currentUrl;
     this.staged = null;
@@ -391,6 +431,8 @@ export class DoorPeer {
       previousPlayer.hidden = true;
       this.releaseVideo(previousPlayer, previousUrl);
     } else if (previousUrl) URL.revokeObjectURL(previousUrl);
+    this.onPlayback('');
+    if (this.requested.op === 'segment') this.onClip({url:this.currentUrl, stamp:next.stamp});
     this.activeVideo.play().catch(e => {
       if (e.name === 'NotAllowedError') this.onStatus('online', 'Нажми ▶ на видео для воспроизведения.');
     });

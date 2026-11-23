@@ -4,7 +4,7 @@ window.device = (() => {
   const peers = new Map();
   const iceRequests = new Map();
   let ticket = 0;
-  let socket, url, key, retry, lastReply, permanentFailure;
+  let socket, url, key, retry, lastReply, permanentFailure, healthEnabled;
   let delay = 1000;
 
   function signal(frame) {
@@ -48,7 +48,9 @@ window.device = (() => {
     if (!raw) throw Error('Файл недоступен');
     const file = JSON.parse(raw);
     if (!file.token) {
-      reply({type: 'result', value: file.growing ? {growing:true} : null});
+      if (file.expired && cmd.states !== true) throw Error('Файл недоступен');
+      const value = file.growing ? {growing:true} : file.expired ? {expired:true} : null;
+      reply({type: 'result', value});
       return;
     }
     try {
@@ -166,6 +168,7 @@ window.device = (() => {
     Archive.connection('connecting');
     const ws = new WebSocket(url);
     socket = ws;
+    healthEnabled = false;
     lastReply = Date.now();
     ws.onopen = () => { if (socket === ws) signal({type: 'auth', key: key}); };
     ws.onmessage = e => {
@@ -173,7 +176,12 @@ window.device = (() => {
       try {
         const msg = JSON.parse(e.data);
         lastReply = Date.now();
-        if (msg.type === 'ready') { delay = 1000; Archive.connection('online'); }
+        if (msg.type === 'ready') {
+          delay = 1000;
+          Archive.connection('online');
+          healthEnabled = msg.health === true;
+          if (healthEnabled) signal({type:'health', capture:Archive.captureState()});
+        }
         if (msg.type === 'offer') offer(msg);
         if (msg.type === 'leave') leave(msg.peer);
         if (msg.type === 'ice') {
@@ -191,7 +199,7 @@ window.device = (() => {
       Array.from(peers.keys()).forEach(leave);
       Archive.connection(e.code === 1008 ? 'unauthorized' : 'offline');
       if (e.code === 1008) permanentFailure = true;
-      else {
+      else if (url) {
         retry = setTimeout(openSocket, delay);
         delay = Math.min(delay * 2, 30000);
       }
@@ -201,11 +209,18 @@ window.device = (() => {
 
   return {
     start: (endpoint, secret) => { url = endpoint; key = secret; openSocket(); },
+    stop: () => {
+      url = null;
+      clearTimeout(retry);
+      if (healthEnabled) signal({type:'health', capture:'stopped'});
+      if (socket) socket.close();
+    },
     ice,
     tick: () => {
       if (!url || permanentFailure) return;
       if (!socket) return openSocket();
       if (Date.now() - lastReply > 90000) socket.close();
+      else if (healthEnabled) signal({type:'health', capture:Archive.captureState()});
       else signal({type: 'ping'});
     }
   };
