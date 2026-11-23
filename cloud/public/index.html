@@ -19,20 +19,30 @@
   <section id="dashboard" hidden>
     <div class="title"><h1>Входная дверь</h1><span id="status" role="status">Подключение…</span></div>
     <div class="columns"><section class="monitor" aria-labelledby="screen-title">
-      <div class="screen">
+      <div class="screen" data-mode="idle">
         <video id="video" muted playsinline preload="auto" controls aria-label="Видео с камеры"></video>
         <video id="video-buffer" muted playsinline preload="auto" controls aria-label="Видео с камеры" hidden></video>
         <div id="screen-idle"><span class="lens small" aria-hidden="true"><i></i></span><span id="screen-hint">Ожидание камеры</span></div>
       </div>
-      <div class="transport"><div><h2 id="screen-title">Прямой эфир</h2><span id="player-info" role="status"></span></div>
+      <div class="transport"><div><h2 id="screen-title" tabindex="-1">Прямой эфир</h2><span id="player-info" role="status"></span></div>
         <button id="live" class="accent" disabled>Смотреть эфир</button>
         <button id="stop" hidden>Остановить</button>
       </div>
+      <button id="back-to-recordings" hidden>К списку записей</button>
     </section>
     <section class="history" aria-labelledby="history-title">
-      <div class="history-head"><h2 id="history-title">Записи</h2><button id="refresh" disabled>Обновить</button></div>
-      <div id="recordings" aria-live="polite"><p>Подключение к архиву…</p></div>
-      <button id="more" hidden>Показать ещё</button>
+      <div class="history-head"><h2 id="history-title">Записи движения</h2><button id="refresh" disabled>Обновить</button></div>
+      <div class="archive-filters" role="group" aria-label="День записи" hidden>
+        <button id="today" aria-pressed="false">Сегодня</button>
+        <button id="yesterday" aria-pressed="false">Вчера</button>
+        <select id="archive-date" aria-label="Выбрать дату"></select>
+      </div>
+      <h3 id="archive-summary" class="date" hidden></h3>
+      <p id="archive-status" role="status">Подключение к архиву…</p>
+      <div class="archive-list">
+        <div id="recordings"></div>
+        <button id="more" hidden>Показать ещё</button>
+      </div>
     </section></div>
   </section>
 </main></body></html>

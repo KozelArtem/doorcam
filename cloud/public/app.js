@@ -3,8 +3,13 @@ import { dayKey, eventFromUrl, groupDays } from './library.mjs';
 
 const el = id => document.getElementById(id);
 const dateLabel = new Intl.DateTimeFormat('ru', {day:'numeric',month:'long',year:'numeric'});
+const shortDate = new Intl.DateTimeFormat('ru', {day:'numeric',month:'long'});
 const timeLabel = new Intl.DateTimeFormat('ru', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
-let peer, pendingEvent = eventFromUrl(location.search), events = [], selected = '', visible = 30;
+const plurals = new Intl.PluralRules('ru');
+const mobile = matchMedia('(max-width: 760px)');
+const pageSize = 30;
+let peer, pendingEvent = eventFromUrl(location.search), events = [], selected = '';
+let days = new Map(), archiveDay = '', visible = pageSize;
 let status = 'connecting', mode = 'idle', loadedArchive = false, generation = 0;
 let observer, queue = [], inflight = 0;
 const urls = new Set();
@@ -16,6 +21,9 @@ function gate(message, login = true, retry = false) {
   old?.close();
   resetPhotos();
   events = [];
+  days.clear();
+  archiveDay = '';
+  visible = pageSize;
   selected = '';
   loadedArchive = false;
   el('recordings').replaceChildren();
@@ -53,24 +61,73 @@ async function photos() {
   }
   finally { inflight--; void photos(); }
 }
-function choose(id) {
+function choose(id, fromLink = false) {
   if (!peer || status !== 'online') return;
   selected = id;
-  const list = el('recordings').querySelectorAll('.clip');
-  for (const row of list) row.setAttribute('aria-current', String(row.dataset.id === id));
+  if (fromLink && loadedArchive && revealSelectedDay()) list();
+  for (const row of el('recordings').querySelectorAll('.clip')) markClip(row);
   peer.playEvent(id);
+  if (!fromLink && mobile.matches) {
+    el('screen-title').focus({preventScroll:true});
+    document.querySelector('.monitor').scrollIntoView({block:'start'});
+  }
+}
+function markClip(row) {
+  const current = row.dataset.id === selected;
+  row.setAttribute('aria-current', String(current));
+  row.querySelector('.clip-current').hidden = !current;
+}
+function recentDays() {
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  return [dayKey(today), dayKey(yesterday)];
+}
+function revealSelectedDay() {
+  const event = events.find(item => String(item.id) === selected);
+  if (!event) return false;
+  const day = dayKey(event.time);
+  const index = days.get(day).indexOf(event);
+  if (archiveDay === day && index < visible) return false;
+  archiveDay = day;
+  visible = pageSize * Math.ceil((index + 1) / pageSize);
+  return true;
+}
+function showDay(day) {
+  archiveDay = day;
+  visible = pageSize;
+  list();
+  document.querySelector('.archive-list').scrollTop = 0;
 }
 function list() {
   resetPhotos();
   const container = el('recordings');
   container.replaceChildren();
-  el('more').hidden = events.length <= visible;
-  if (!events.length) {
-    const hint = document.createElement('p');
-    hint.textContent = loadedArchive ? 'Записей пока нет.' : 'Ожидание архива на телефоне…';
-    container.append(hint);
-    return;
-  }
+  const [today, yesterday] = recentDays();
+  const day = archiveDay || (days.has(today) ? today : days.keys().next().value) || today;
+  const group = days.get(day) ?? [];
+  const picker = el('archive-date');
+  const prompt = new Option('Выбрать дату', '');
+  prompt.disabled = true;
+  picker.replaceChildren(prompt);
+  for (const [key, clips] of days) picker.add(new Option(dateLabel.format(clips[0].time), key));
+  picker.value = day === today || day === yesterday || !days.has(day) ? '' : day;
+  el('today').setAttribute('aria-pressed', String(day === today));
+  el('yesterday').setAttribute('aria-pressed', String(day === yesterday));
+  document.querySelector('.archive-filters').hidden = !loadedArchive;
+  el('more').hidden = group.length <= visible;
+  const summary = el('archive-summary');
+  summary.hidden = !group.length;
+  const notice = el('archive-status');
+  notice.textContent = !loadedArchive ? 'Ожидание архива на телефоне…' :
+    !events.length ? 'Записей пока нет.' : !group.length ? 'За этот день записей нет.' : '';
+  if (!group.length) return;
+  const time = group[0].time;
+  const label = day === today ? `Сегодня, ${shortDate.format(time)}` :
+    day === yesterday ? `Вчера, ${shortDate.format(time)}` : dateLabel.format(time);
+  const count = group.length;
+  const noun = {one:'запись', few:'записи', many:'записей'}[plurals.select(count)];
+  summary.textContent = `${label} · ${count} ${noun}`;
   if ('IntersectionObserver' in window) {
     observer = new IntersectionObserver(items => {
       for (const item of items) if (item.isIntersecting) {
@@ -80,35 +137,34 @@ function list() {
       void photos();
     });
   }
-  for (const group of groupDays(events.slice(0, visible)).values()) {
-    const date = document.createElement('h3');
-    date.className = 'date';
-    date.textContent = dayKey(group[0].time) === dayKey(Date.now()) ? 'Сегодня' : dateLabel.format(group[0].time);
-    container.append(date);
-    for (const event of group) {
-      const id = String(event.id);
-      const row = document.createElement('button');
-      row.className = 'clip';
-      row.dataset.id = id;
-      row.setAttribute('aria-current', String(id === selected));
-      row.onclick = () => choose(id);
-      const thumb = document.createElement('span');
-      thumb.className = 'thumb';
-      thumb.textContent = '▷';
-      thumb.dataset.id = id;
-      thumb.setAttribute('aria-hidden','true');
-      const time = document.createElement('time');
-      time.dateTime = new Date(event.time).toISOString();
-      time.textContent = timeLabel.format(event.time);
-      row.setAttribute('aria-label', 'Посмотреть запись ' + dateLabel.format(event.time) + ', ' + time.textContent);
-      row.append(thumb,time);
-      container.append(row);
-      observer?.observe(thumb);
-    }
+  for (const event of group.slice(0, visible)) {
+    const id = String(event.id);
+    const row = document.createElement('button');
+    row.className = 'clip';
+    row.dataset.id = id;
+    row.onclick = () => choose(id);
+    const thumb = document.createElement('span');
+    thumb.className = 'thumb';
+    thumb.textContent = '▷';
+    thumb.dataset.id = id;
+    thumb.setAttribute('aria-hidden','true');
+    const time = document.createElement('time');
+    time.dateTime = new Date(event.time).toISOString();
+    time.textContent = timeLabel.format(event.time);
+    row.setAttribute('aria-label', 'Посмотреть запись ' + dateLabel.format(event.time) + ', ' + time.textContent);
+    const current = document.createElement('span');
+    current.className = 'clip-current';
+    current.textContent = 'Выбрана';
+    row.append(thumb,time,current);
+    markClip(row);
+    container.append(row);
+    observer?.observe(thumb);
   }
 }
 function displayMode(next) {
   mode = next;
+  document.querySelector('.screen').dataset.mode = mode;
+  el('back-to-recordings').hidden = !selected;
   el('stop').hidden = mode === 'idle';
   el('live').hidden = mode === 'live';
   el('screen-idle').hidden = mode !== 'idle';
@@ -151,14 +207,17 @@ function openCamera() {
         const id = pendingEvent;
         pendingEvent = null;
         queueMicrotask(() => {
-          if (current()) choose(id);
+          if (current()) choose(id, true);
         });
       }
     },
     onArchive(incoming) {
       if (!current()) return;
-      events = [...incoming].sort((a,b) => b.time-a.time);
+      const first = !loadedArchive;
+      events = incoming;
+      days = groupDays(events);
       loadedArchive = true;
+      if (first && selected) revealSelectedDay();
       list();
     }
   });
@@ -190,12 +249,27 @@ async function login() {
 }
 el('live').onclick = () => {
   selected = '';
-  for (const row of el('recordings').querySelectorAll('[aria-current=true]')) row.setAttribute('aria-current','false');
+  for (const row of el('recordings').querySelectorAll('[aria-current=true]')) markClip(row);
   peer?.live();
 };
 el('stop').onclick = () => peer?.stop();
 el('refresh').onclick = () => peer?.list();
-el('more').onclick = () => { visible += 30; list(); };
+el('today').onclick = () => showDay(recentDays()[0]);
+el('yesterday').onclick = () => showDay(recentDays()[1]);
+el('archive-date').onchange = e => showDay(e.target.value);
+el('back-to-recordings').onclick = () => {
+  if (revealSelectedDay()) list();
+  const row = el('recordings').querySelector('[aria-current=true]');
+  const target = row ?? (loadedArchive ? el('today') : el('refresh'));
+  target.scrollIntoView({block:'center'});
+  target.focus({preventScroll:true});
+};
+el('more').onclick = () => {
+  const firstNew = visible;
+  visible += pageSize;
+  list();
+  el('recordings').children[firstNew]?.focus();
+};
 el('retry').onclick = login;
 el('logout').onclick = async () => {
   try {
