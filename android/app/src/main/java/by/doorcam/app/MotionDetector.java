@@ -3,11 +3,13 @@ package by.doorcam.app;
 import java.util.Arrays;
 
 final class MotionDetector {
+    private static final int DIMMING_TOLERANCE = 12;
     private final double fraction;
     private final int[] histogram = new int[511];
     private byte[] previous;
     private MotionZone zone;
     private int columns, rows, rotation, left, top, right, bottom;
+    private boolean dimming;
     MotionDetector(int sensitivity) {
         fraction = 0.10 - 0.00085 * Math.max(0, Math.min(100, sensitivity));
     }
@@ -29,6 +31,7 @@ final class MotionDetector {
             right = sampleBoundary(bounds[2], columns);
             bottom = sampleBoundary(bounds[3], rows);
             previous = Arrays.copyOf(pixels, pixels.length);
+            dimming = false;
             return false;
         }
         int countPixels = (right - left) * (bottom - top);
@@ -43,12 +46,46 @@ final class MotionDetector {
         int middle = 0, count = 0;
         while ((count += histogram[middle]) < (countPixels + 1) / 2) middle++;
         // Larger exposure shifts can change highlights and shadows by different amounts.
-        int tolerance = Math.min(20, 10 + Math.abs(middle - 255) / 2);
+        int shift = middle - 255;
+        int tolerance = Math.min(20, 10 + Math.abs(shift) / 2);
         int unchanged = 0;
         for (int bin = Math.max(0, middle - tolerance); bin <= Math.min(histogram.length - 1, middle + tolerance); bin++)
             unchanged += histogram[bin];
+        double threshold = fraction * countPixels;
+        boolean moving = countPixels - unchanged >= threshold;
+        // Keep compensating while the scene settles after the initial drop.
+        dimming = shift < -tolerance || (dimming && shift < 0);
+        if (moving && dimming) moving = motionAfterDimming(pixels, threshold);
         System.arraycopy(pixels, 0, previous, 0, pixels.length);
-        return countPixels - unchanged >= fraction * countPixels;
+        return moving;
+    }
+
+    private boolean motionAfterDimming(byte[] pixels, double threshold) {
+        // With a sharp drop in light, bright surfaces can lose more luma than dark ones.
+        // Fit the median brightness ratio so a moving patch does not set the exposure.
+        Arrays.fill(histogram, 0);
+        int samples = 0;
+        for (int row = top; row < bottom; row++) {
+            int offset = row * columns;
+            for (int i = offset + left, end = offset + right; i < end; i++) {
+                int before = previous[i] & 255;
+                if (before == 0) continue;
+                int after = pixels[i] & 255;
+                histogram[Math.min(255, (255 * after + before / 2) / before)]++;
+                samples++;
+            }
+        }
+        int gain = 0, cumulative = 0;
+        while ((cumulative += histogram[gain]) < (samples + 1) / 2) gain++;
+        int changed = 0;
+        for (int row = top; row < bottom; row++) {
+            int offset = row * columns;
+            for (int i = offset + left, end = offset + right; i < end; i++) {
+                int residual = 255 * (pixels[i] & 255) - gain * (previous[i] & 255);
+                if (Math.abs(residual) > 255 * DIMMING_TOLERANCE && ++changed >= threshold) return true;
+            }
+        }
+        return false;
     }
 
     private static int sampleBoundary(int percent, int samples) {

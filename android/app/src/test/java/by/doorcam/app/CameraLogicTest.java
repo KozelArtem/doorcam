@@ -23,7 +23,7 @@ public class CameraLogicTest {
         assertFalse(detector.observe(pixels));
     }
 
-    @Test public void exposureCompensationIncludesTwentyLevelsAtHistogramEdges() {
+    @Test public void exposureCompensationWorksAtHistogramEdges() {
         MotionDetector detector = new MotionDetector(50);
         byte[] pixels = new byte[100];
         assertFalse(detector.observe(pixels));
@@ -32,8 +32,36 @@ public class CameraLogicTest {
         assertFalse(detector.observe(pixels));
         Arrays.fill(pixels, (byte) 0);
         Arrays.fill(pixels, 0, 10, (byte) 1);
-        assertTrue(detector.observe(pixels));
+        assertFalse(detector.observe(pixels));
         Arrays.fill(pixels, (byte) 255);
+        assertFalse(detector.observe(pixels));
+    }
+
+    @Test public void rapidDimmingOfATexturedSceneDoesNotTriggerMotion() {
+        MotionDetector detector = new MotionDetector(50);
+        byte[] pixels = new byte[100];
+        Arrays.fill(pixels, (byte) 67);
+        Arrays.fill(pixels, 0, 27, (byte) 240);
+        assertFalse(detector.observe(pixels));
+        Arrays.fill(pixels, (byte) 11);
+        Arrays.fill(pixels, 0, 27, (byte) 40);
+        assertFalse(detector.observe(pixels));
+        Arrays.fill(pixels, (byte) 8);
+        Arrays.fill(pixels, 0, 27, (byte) 23);
+        assertFalse(detector.observe(pixels));
+        assertFalse(detector.observe(pixels));
+    }
+
+    @Test public void localMovementDuringRapidDimmingStillTriggers() {
+        MotionDetector detector = new MotionDetector(50);
+        byte[] pixels = new byte[100];
+        Arrays.fill(pixels, (byte) 67);
+        Arrays.fill(pixels, 0, 27, (byte) 180);
+        assertFalse(detector.observe(pixels));
+        Arrays.fill(pixels, (byte) 11);
+        Arrays.fill(pixels, 0, 27, (byte) 30);
+        Arrays.fill(pixels, 40, 50, (byte) 27);
+        assertTrue(detector.observe(pixels));
         assertFalse(detector.observe(pixels));
     }
 
