@@ -14,6 +14,10 @@ final class MotionDetector {
         fraction = 0.10 - 0.00085 * Math.max(0, Math.min(100, sensitivity));
     }
 
+    void reset() {
+        previous = null;
+    }
+
     boolean observe(byte[] pixels) {
         return observe(pixels, pixels.length, 1, 0, MotionZone.FULL);
     }

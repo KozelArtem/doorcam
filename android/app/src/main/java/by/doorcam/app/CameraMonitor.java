@@ -163,20 +163,11 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
             previousFrame = now;
             long elapsed = SystemClock.elapsedRealtime();
             health.frame(elapsed);
-            Image.Plane y = image.getPlanes()[0];
-            ByteBuffer buf = y.getBuffer();
-            int width = image.getWidth(), height = image.getHeight();
-            int rowStride = y.getRowStride(), pixelStride = y.getPixelStride();
-            int base = buf.position(), sample = 0;
-            for (int row = 0; row < SAMPLE_ROWS; row++) {
-                int offset = base + ((2 * row + 1) * height / (2 * SAMPLE_ROWS)) * rowStride;
-                for (int col = 0; col < SAMPLE_COLUMNS; col++) {
-                    int x = (2 * col + 1) * width / (2 * SAMPLE_COLUMNS);
-                    samples[sample++] = buf.get(offset + x * pixelStride);
-                }
-            }
             byte[] photo = null;
-            if (detector.observe(samples, SAMPLE_COLUMNS, SAMPLE_ROWS, rotation, MonitorService.motionZone)) {
+            if (!MonitorService.motionEnabled) {
+                detector.reset();
+                MonitorService.calibrationMotionAt = 0;
+            } else if (detectMotion(image)) {
                 MonitorService.calibrationMotionAt = elapsed;
                 if (archive.needsPhoto(now)) photo = jpeg(image);
                 if (archive.motion(now, photo)) {
@@ -193,6 +184,22 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
                 }
             }
         } catch (Exception error) { failed(error); }
+    }
+
+    private boolean detectMotion(Image image) {
+        Image.Plane y = image.getPlanes()[0];
+        ByteBuffer buf = y.getBuffer();
+        int width = image.getWidth(), height = image.getHeight();
+        int rowStride = y.getRowStride(), pixelStride = y.getPixelStride();
+        int base = buf.position(), sample = 0;
+        for (int row = 0; row < SAMPLE_ROWS; row++) {
+            int offset = base + ((2 * row + 1) * height / (2 * SAMPLE_ROWS)) * rowStride;
+            for (int col = 0; col < SAMPLE_COLUMNS; col++) {
+                int x = (2 * col + 1) * width / (2 * SAMPLE_COLUMNS);
+                samples[sample++] = buf.get(offset + x * pixelStride);
+            }
+        }
+        return detector.observe(samples, SAMPLE_COLUMNS, SAMPLE_ROWS, rotation, MonitorService.motionZone);
     }
 
     private byte[] jpeg(Image image) throws IOException {

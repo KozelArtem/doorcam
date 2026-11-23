@@ -23,11 +23,13 @@ public final class MonitorService extends Service {
     private static final String CHANNEL = "monitor";
     private static final int NOTIFICATION = 17;
     static final String STOP = "by.doorcam.app.STOP";
+    static final String MOTION_ENABLED = "motionEnabled";
     static volatile boolean running;
     static volatile String status = "Наблюдение остановлено";
     static volatile long lastEvent;
     static volatile String lanUrl = "";
     static volatile MotionZone motionZone = MotionZone.FULL;
+    static volatile boolean motionEnabled = true;
     static volatile boolean calibrationVisible;
     static volatile byte[] calibrationPreview;
     static volatile long calibrationMotionAt;
@@ -101,7 +103,9 @@ public final class MonitorService extends Service {
         captureHealth = null;
         capture = "starting";
         status = "Подготовка камеры";
-        motionZone = MotionZone.read(getSharedPreferences("doorcam", MODE_PRIVATE));
+        SharedPreferences settings = getSharedPreferences("doorcam", MODE_PRIVATE);
+        motionZone = MotionZone.read(settings);
+        motionEnabled = settings.getBoolean(MOTION_ENABLED, true);
         wakeLock = getSystemService(PowerManager.class).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Doorcam:Capture");
         wakeLock.acquire();
         worker.post(this::open);

@@ -11,6 +11,18 @@ import static org.junit.Assert.*;
 public class CameraLogicTest {
     @Rule public TemporaryFolder temp = new TemporaryFolder();
 
+    @Test public void restartingDetectionUsesAFrameFromTheNewSession() {
+        MotionDetector detector = new MotionDetector(50);
+        byte[] pixels = new byte[100];
+        Arrays.fill(pixels, (byte) 80);
+        assertFalse(detector.observe(pixels));
+        detector.reset();
+        Arrays.fill(pixels, 0, 20, (byte) 180);
+        assertFalse(detector.observe(pixels));
+        Arrays.fill(pixels, 0, 20, (byte) 80);
+        assertTrue(detector.observe(pixels));
+    }
+
     @Test public void localChangeTriggersButGlobalBrightnessDoesNot() {
         MotionDetector detector = new MotionDetector(50);
         byte[] pixels = new byte[1600];

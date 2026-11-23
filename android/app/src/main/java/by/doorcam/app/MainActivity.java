@@ -2,6 +2,7 @@ package by.doorcam.app;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.*;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
@@ -13,11 +14,13 @@ import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.InsetDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.hardware.camera2.*;
 import android.os.*;
 import android.text.InputType;
 import android.view.*;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.*;
 import java.net.URI;
 import java.text.DateFormat;
@@ -29,12 +32,17 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 public final class MainActivity extends Activity {
+    private static final int HOME = 0, SETTINGS = 1;
+    private final ScrollView[] pages = new ScrollView[2];
+    private final Button[] tabs = new Button[pages.length];
+    private int selectedTab = HOME;
     private SharedPreferences prefs;
     private TextView state, lastMotion, resources, sensitivityLabel, lanAddress;
     private EditText origin, key, limit;
     private Spinner cameras;
     private SeekBar sensitivity;
     private Button start, stop;
+    private ToggleButton recordingSection, remoteSection;
     private CheckBox calibration;
     private TextView calibrationStatus;
     private ZonePreview zonePreview;
@@ -63,7 +71,7 @@ public final class MainActivity extends Activity {
             limit.setEnabled(!active);
             origin.setEnabled(!active);
             key.setEnabled(!active);
-            if (calibration.isChecked()) refreshCalibration(active);
+            if (MonitorService.calibrationVisible) refreshCalibration(active);
             ui.postDelayed(this, 750);
         }
     };
@@ -71,21 +79,89 @@ public final class MainActivity extends Activity {
     @Override public void onCreate(Bundle saved) {
         super.onCreate(saved);
         prefs = getSharedPreferences("doorcam", MODE_PRIVATE);
+        LinearLayout root = column();
+        FrameLayout screens = new FrameLayout(this);
+        root.addView(screens, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
+        LinearLayout body = page(screens, HOME, "Doorcam");
+        buildHome(body);
+        buildSettings(page(screens, SETTINGS, "Настройки"));
+        bottomTabs(root);
+        setContentView(root);
+        showTab(saved == null ? HOME : saved.getInt("tab", HOME));
+    }
+
+    private LinearLayout page(FrameLayout screens, int tab, String title) {
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
-        scroll.setClipToPadding(false);
-        scroll.setPadding(dp(20), dp(24), dp(20), dp(32));
+        scroll.setPadding(dp(16), dp(12), dp(16), dp(8));
+        pages[tab] = scroll;
+        screens.addView(scroll, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
         LinearLayout body = column();
-        int width = Math.min(560, Math.max(0, getResources().getConfiguration().screenWidthDp - 40));
+        int width = Math.min(520, getResources().getConfiguration().screenWidthDp - 32);
         scroll.addView(body, new FrameLayout.LayoutParams(dp(width), ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP | Gravity.CENTER_HORIZONTAL));
         body.setFocusableInTouchMode(true);
-        body.requestFocus();
-        setContentView(scroll);
-        heading(body, "Doorcam", 32, 0).setLetterSpacing(-0.035f);
-        label(body, "Дверной глазок", 16, R.color.doorcam_muted, 2);
+        heading(body, title, 26, 0).setLetterSpacing(-0.025f);
+        return body;
+    }
 
-        LinearLayout hero = card(body, 24);
+    private void bottomTabs(LinearLayout root) {
+        LinearLayout bar = new LinearLayout(this);
+        bar.setPadding(dp(4), dp(4), dp(4), dp(4));
+        bar.setBackground(surface(R.color.doorcam_surface, 32, R.color.doorcam_border));
+        bar.setElevation(dp(8));
+        int width = Math.min(260, getResources().getConfiguration().screenWidthDp - 32);
+        LinearLayout.LayoutParams position = new LinearLayout.LayoutParams(dp(width), ViewGroup.LayoutParams.WRAP_CONTENT);
+        position.gravity = Gravity.CENTER_HORIZONTAL;
+        position.bottomMargin = dp(8);
+        root.addView(bar, position);
+
+        String[] names = {"Главная", "Настройки"};
+        for (int i = 0; i < tabs.length; i++) {
+            int tab = i;
+            Button button = new Button(this);
+            button.setText(names[i]);
+            button.setAllCaps(false);
+            button.setTextSize(13);
+            button.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+            button.setMinWidth(0);
+            button.setMinimumWidth(0);
+            button.setMinHeight(dp(48));
+            button.setPadding(dp(4), dp(8), dp(4), dp(8));
+            button.setStateListAnimator(null);
+            button.setOnClickListener(v -> showTab(tab));
+            tabs[i] = button;
+            bar.addView(button, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        }
+    }
+
+    private void showTab(int tab) {
+        View focus = getCurrentFocus();
+        if (tab != selectedTab && focus instanceof EditText) {
+            getSystemService(InputMethodManager.class).hideSoftInputFromWindow(focus.getWindowToken(), 0);
+        }
+        selectedTab = tab;
+        for (int i = 0; i < pages.length; i++) {
+            boolean selected = i == tab;
+            pages[i].setVisibility(selected ? View.VISIBLE : View.GONE);
+            Button button = tabs[i];
+            button.setSelected(selected);
+            button.setTextColor(getColor(selected ? R.color.doorcam_on_accent : R.color.doorcam_text));
+            button.setBackground(new RippleDrawable(ColorStateList.valueOf(selected ? 0x30000000 : 0x30FFFFFF),
+                    surface(selected ? R.color.doorcam_accent : R.color.doorcam_surface, 26, 0), null));
+        }
+        pages[tab].getChildAt(0).requestFocus();
+        updateCalibrationVisibility();
+    }
+
+    @Override protected void onSaveInstanceState(Bundle out) {
+        super.onSaveInstanceState(out);
+        out.putInt("tab", selectedTab);
+    }
+
+    private void buildHome(LinearLayout body) {
+        LinearLayout hero = card(body, 12);
         hero.setBackground(rounded(new int[]{getColor(R.color.doorcam_hero), getColor(R.color.doorcam_surface)},
                 24, R.color.doorcam_border));
         LinearLayout headline = new LinearLayout(this);
@@ -93,29 +169,60 @@ public final class MainActivity extends Activity {
         hero.addView(headline);
         LinearLayout status = column();
         headline.addView(status, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
-        heading(status, "Мониторинг", 14, 0).setTextColor(getColor(R.color.doorcam_accent));
-        state = heading(status, MonitorService.status, 24, 4);
+        state = heading(status, MonitorService.status, 20, 0);
         state.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         ImageView lens = new ImageView(this);
         lens.setImageResource(R.drawable.doorcam_lens);
         lens.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
-        LinearLayout.LayoutParams lensParams = new LinearLayout.LayoutParams(dp(72), dp(72));
+        LinearLayout.LayoutParams lensParams = new LinearLayout.LayoutParams(dp(38), dp(38));
         lensParams.setMarginStart(dp(12));
         headline.addView(lens, lensParams);
-        lastMotion = label(hero, "", 14, R.color.doorcam_muted, 12);
-        start = action(hero, "Начать наблюдение", true);
-        stop = action(hero, "Остановить наблюдение", false);
+        lastMotion = label(hero, "", 13, R.color.doorcam_muted, 6);
+        start = action(hero, "Начать наблюдение", R.color.doorcam_on_accent, R.color.doorcam_accent, 0);
+        stop = action(hero, "Остановить наблюдение", R.color.doorcam_stop, R.color.doorcam_surface, R.color.doorcam_stop);
         start.setVisibility(MonitorService.running ? View.GONE : View.VISIBLE);
         stop.setVisibility(MonitorService.running ? View.VISIBLE : View.GONE);
         start.setOnClickListener(v -> prepare());
         stop.setOnClickListener(v -> stopService(new Intent(this, MonitorService.class)));
-        divider(hero, 16);
-        resources = heading(hero, "", 16, 12);
-        label(hero, "Нагрузка Doorcam · 100 % ЦП = одно ядро", 13, R.color.doorcam_muted, 2);
+        action(hero, "Предпросмотр камеры", R.color.doorcam_text, R.color.doorcam_surface, R.color.doorcam_border)
+                .setOnClickListener(v -> showCameraPreview());
 
-        LinearLayout wifi = card(body, 16);
-        heading(wifi, "Просмотр по Wi-Fi", 20, 0);
-        lanAddress = label(wifi, "", 16, R.color.doorcam_muted, 8);
+        divider(hero, 12);
+        Switch detector = new Switch(this);
+        detector.setText("Детектор движения");
+        detector.setTextSize(14);
+        detector.setTextColor(getColor(R.color.doorcam_text));
+        detector.setMinHeight(dp(48));
+        detector.setSwitchPadding(dp(12));
+        detector.setChecked(prefs.getBoolean(MonitorService.MOTION_ENABLED, true));
+        add(hero, detector, 2);
+        detector.setOnCheckedChangeListener((button, checked) -> {
+            prefs.edit().putBoolean(MonitorService.MOTION_ENABLED, checked).apply();
+            MonitorService.motionEnabled = checked;
+        });
+    }
+
+    private void showCameraPreview() {
+        LinearLayout content = column();
+        content.setPadding(dp(18), dp(10), dp(18), 0);
+        FrameLayout frame = new FrameLayout(this);
+        frame.setBackground(surface(R.color.doorcam_background, 16, R.color.doorcam_border));
+        content.addView(frame, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(132)));
+        ImageView lens = new ImageView(this);
+        lens.setImageResource(R.drawable.doorcam_lens);
+        lens.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        frame.addView(lens, new FrameLayout.LayoutParams(dp(44), dp(44), Gravity.CENTER));
+        label(content, "Изображение с камеры пока недоступно", 13, R.color.doorcam_muted, 8);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("Предпросмотр камеры").setView(content)
+                .setPositiveButton("Закрыть", null).create();
+        dialog.show();
+        dialog.getWindow().setBackgroundDrawable(new InsetDrawable(
+                surface(R.color.doorcam_surface, 22, R.color.doorcam_border), dp(12), 0, dp(12), 0));
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setAllCaps(false);
+    }
+
+    private void buildWifi(LinearLayout wifi) {
+        lanAddress = label(wifi, "", 15, R.color.doorcam_muted, 0);
         lanAddress.setMinHeight(dp(48));
         lanAddress.setGravity(Gravity.CENTER_VERTICAL);
         lanAddress.setAutoLinkMask(android.text.util.Linkify.WEB_URLS);
@@ -130,10 +237,15 @@ public final class MainActivity extends Activity {
         passwordLabel.setLabelFor(password.getId());
         password.setTypeface(Typeface.MONOSPACE);
         password.setTextIsSelectable(true);
+    }
 
-        LinearLayout recording = card(body, 16);
-        heading(recording, "Параметры записи", 20, 0);
-        TextView cameraLabel = label(recording, "Камера", 14, R.color.doorcam_muted, 16);
+    private void buildSettings(LinearLayout body) {
+        LinearLayout recording = column();
+        LinearLayout cameraCard = card(body, 12);
+        cameraCard.setBackground(rounded(new int[]{getColor(R.color.doorcam_hero), getColor(R.color.doorcam_surface)},
+                18, R.color.doorcam_border));
+        recordingSection = settingsSection(cameraCard, "Камера и запись", recording);
+        TextView cameraLabel = label(recording, "Камера", 14, R.color.doorcam_muted, 0);
         cameras = new Spinner(this);
         cameras.setId(View.generateViewId());
         cameras.setMinimumHeight(dp(48));
@@ -159,16 +271,64 @@ public final class MainActivity extends Activity {
         limit = field(recording, "Лимит видеоархива, МиБ", InputType.TYPE_CLASS_NUMBER,
                 String.valueOf(prefs.getInt("limit", 1024)));
 
-        LinearLayout remote = card(body, 16);
-        heading(remote, "Удалённый доступ", 20, 0);
+        label(body, "Подключения", 13, R.color.doorcam_muted, 14);
+        LinearLayout connections = card(body, 6);
+        LinearLayout remote = column();
+        remoteSection = settingsSection(connections, "Удалённый доступ", remote);
         label(remote, "Для записи без Telegram и удалённого просмотра оставьте оба поля пустыми.",
-                14, R.color.doorcam_muted, 8);
+                13, R.color.doorcam_muted, 0);
         origin = field(remote, "Адрес сайта Doorcam", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI,
                 prefs.getString("origin", ""));
         origin.setHint("https://doorcam.example.com");
         key = field(remote, "Ключ устройства", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD,
                 prefs.getString("key", ""));
         key.setSaveEnabled(false);
+
+        divider(connections, 0);
+        LinearLayout wifi = column();
+        settingsSection(connections, "Просмотр по Wi-Fi", wifi);
+        buildWifi(wifi);
+
+        LinearLayout diagnostics = column();
+        settingsSection(card(body, 12), "Нагрузка Doorcam", diagnostics);
+        resources = heading(diagnostics, "", 15, 0);
+        label(diagnostics, "100 % ЦП = одно ядро", 13, R.color.doorcam_muted, 4);
+    }
+
+    private ToggleButton settingsSection(LinearLayout section, String title, LinearLayout content) {
+        section.setPadding(dp(14), 0, dp(14), 0);
+        ToggleButton header = new ToggleButton(this);
+        header.setText(title);
+        header.setTextOn(title);
+        header.setTextOff(title);
+        header.setAllCaps(false);
+        header.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        header.setTextSize(15);
+        header.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        header.setTextColor(getColor(R.color.doorcam_text));
+        header.setMinHeight(dp(52));
+        header.setPadding(dp(2), 0, dp(2), 0);
+        header.setStateListAnimator(null);
+        header.setBackground(new RippleDrawable(ColorStateList.valueOf(0x30FFFFFF), null,
+                surface(R.color.doorcam_surface, 12, 0)));
+        header.setCompoundDrawableTintList(ColorStateList.valueOf(getColor(R.color.doorcam_muted)));
+        header.setCompoundDrawablesRelativeWithIntrinsicBounds(0, 0, android.R.drawable.arrow_down_float, 0);
+        add(section, header, 0);
+        content.setPadding(dp(2), dp(4), dp(2), dp(14));
+        content.setVisibility(View.GONE);
+        add(section, content, 0);
+        header.setOnCheckedChangeListener((button, expanded) -> {
+            if (!expanded && content.hasFocus()) {
+                getSystemService(InputMethodManager.class).hideSoftInputFromWindow(header.getWindowToken(), 0);
+                header.requestFocusFromTouch();
+            }
+            header.setTextColor(getColor(expanded ? R.color.doorcam_accent : R.color.doorcam_text));
+            header.setCompoundDrawablesRelativeWithIntrinsicBounds(0, 0,
+                    expanded ? android.R.drawable.arrow_up_float : android.R.drawable.arrow_down_float, 0);
+            content.setVisibility(expanded ? View.VISIBLE : View.GONE);
+            if (header == recordingSection) updateCalibrationVisibility();
+        });
+        return header;
     }
 
     private void motionCalibration(LinearLayout recording) {
@@ -229,10 +389,15 @@ public final class MainActivity extends Activity {
         add(controls, reset, 0);
         calibration.setOnCheckedChangeListener((button, checked) -> {
             controls.setVisibility(checked ? View.VISIBLE : View.GONE);
-            MonitorService.calibrationVisible = checked;
-            if (checked) refreshCalibration(MonitorService.running);
-            else clearCalibrationPreview();
+            updateCalibrationVisibility();
         });
+    }
+
+    private void updateCalibrationVisibility() {
+        boolean visible = selectedTab == SETTINGS && recordingSection.isChecked() && calibration.isChecked();
+        MonitorService.calibrationVisible = visible;
+        if (visible) refreshCalibration(MonitorService.running);
+        else clearCalibrationPreview();
     }
 
     private void applyMotionZone(MotionZone zone) {
@@ -251,6 +416,7 @@ public final class MainActivity extends Activity {
         }
         long latestMotion = MonitorService.calibrationMotionAt;
         String text = !active ? "Начните наблюдение для предпросмотра" : preview == null ? "Ждём кадр с камеры…"
+                : !MonitorService.motionEnabled ? "Детектор движения выключен"
                 : latestMotion > 0 && SystemClock.elapsedRealtime() - latestMotion < 1800
                 ? "Движение в зоне" : "Движения в зоне нет";
         if (!text.contentEquals(calibrationStatus.getText())) calibrationStatus.setText(text);
@@ -317,8 +483,8 @@ public final class MainActivity extends Activity {
 
     private LinearLayout card(LinearLayout parent, int top) {
         LinearLayout card = column();
-        card.setBackground(surface(R.color.doorcam_surface, 24, R.color.doorcam_border));
-        card.setPadding(dp(20), dp(18), dp(20), dp(18));
+        card.setBackground(surface(R.color.doorcam_surface, 18, R.color.doorcam_border));
+        card.setPadding(dp(14), dp(12), dp(14), dp(8));
         add(parent, card, top);
         return card;
     }
@@ -326,8 +492,9 @@ public final class MainActivity extends Activity {
     private void divider(LinearLayout parent, int top) {
         View line = new View(this);
         line.setBackgroundColor(getColor(R.color.doorcam_border));
-        line.setMinimumHeight(dp(1));
-        add(parent, line, top);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1));
+        params.topMargin = dp(top);
+        parent.addView(line, params);
     }
 
     private TextView label(LinearLayout parent, String text, int size, int color, int top) {
@@ -346,22 +513,20 @@ public final class MainActivity extends Activity {
         return view;
     }
 
-    private Button action(LinearLayout parent, String text, boolean primary) {
+    private Button action(LinearLayout parent, String text, int textColor, int fill, int stroke) {
         Button button = new Button(this);
         button.setText(text);
         button.setAllCaps(false);
-        button.setTextSize(16);
+        button.setTextSize(14);
         button.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        button.setTextColor(getColor(primary ? R.color.doorcam_on_accent : R.color.doorcam_stop));
-        button.setMinHeight(dp(52));
-        button.setPadding(dp(16), dp(10), dp(16), dp(10));
+        button.setTextColor(getColor(textColor));
+        button.setMinHeight(dp(48));
+        button.setPadding(dp(12), dp(8), dp(12), dp(8));
         button.setStateListAnimator(null);
-        GradientDrawable background = primary
-                ? surface(R.color.doorcam_accent, 14, 0)
-                : surface(R.color.doorcam_surface, 14, R.color.doorcam_stop);
-        int ripple = primary ? 0x30000000 : 0x30FFFFFF;
+        GradientDrawable background = surface(fill, 14, stroke);
+        int ripple = fill == R.color.doorcam_accent ? 0x30000000 : 0x30FFFFFF;
         button.setBackground(new RippleDrawable(ColorStateList.valueOf(ripple), background, null));
-        add(parent, button, 16);
+        add(parent, button, 8);
         return button;
     }
 
@@ -433,9 +598,11 @@ public final class MainActivity extends Activity {
     }
 
     private void fieldError(EditText field, String error) {
+        showTab(SETTINGS);
+        (field == limit ? recordingSection : remoteSection).setChecked(true);
         field.requestFocus();
-        field.requestRectangleOnScreen(new Rect(0, 0, field.getWidth(), field.getHeight()), true);
         field.setError(error);
+        field.post(() -> field.requestRectangleOnScreen(new Rect(0, 0, field.getWidth(), field.getHeight()), true));
     }
 
     private void message(String msg) { Toast.makeText(this, msg, Toast.LENGTH_LONG).show(); }
@@ -449,7 +616,7 @@ public final class MainActivity extends Activity {
     }
     @Override protected void onResume() {
         super.onResume();
-        MonitorService.calibrationVisible = calibration.isChecked();
+        updateCalibrationVisibility();
         ui.post(refresh);
         resources.setText("ЦП — · RAM —");
         ResourceUsage usage = new ResourceUsage();
