@@ -1,0 +1,27 @@
+name = "doorcam"
+main = "src/worker.mjs"
+compatibility_date = "2025-09-01"
+workers_dev = true
+preview_urls = false
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = ["/api/*", "/auth/*", "/telegram/*"]
+
+[[durable_objects.bindings]]
+name = "HUB"
+class_name = "Doorcam"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Doorcam"]
+
+[vars]
+# Canonical HTTPS origin without trailing slash, e.g. https://doorcam.<your-subdomain>.workers.dev
+PUBLIC_ORIGIN = "https://doorcam.akozel000.workers.dev"
+# Numeric Telegram user ID and BotFather Login Widget Client ID, as strings.
+OWNER_ID = "439005602"
+OIDC_CLIENT_ID = "9294953846"
+# Cloudflare Realtime TURN key ID. Leave both TURN settings empty for STUN-only.
+TURN_KEY_ID = ""
