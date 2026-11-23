@@ -173,7 +173,9 @@ for (const buffered of [false, true]) {
     await until(() => source.requests.some(r => r[0] === 'segment' && r[2] === '20'));
     nextPlayer.finish();
     source.growing = false;
-    await until(() => modes.at(-1) === 'idle');
+    await until(() => peer.done);
+    assert.equal(modes.at(-1), 'archive');
+    assert.ok(nextPlayer.src, 'keep the completed clip available to replay');
   });
 }
 

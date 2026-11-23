@@ -333,7 +333,7 @@ export class DoorPeer {
           if (!this.displayed) {
             this.stop();
             this.onStatus('online', 'В записи пока нет видео.');
-          } else if (this.activeVideo.ended) this.stop();
+          }
         }
         return;
       }
@@ -373,8 +373,7 @@ export class DoorPeer {
 
   advance() {
     if (!this.queue.length) {
-      if (this.done) this.stop();
-      else if (!this.fetching && !this.nextPoll) void this.fill();
+      if (!this.done && !this.fetching && !this.nextPoll) void this.fill();
       return;
     }
     if (this.staged && this.staged.player.readyState < 3) return;
