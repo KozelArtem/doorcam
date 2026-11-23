@@ -35,6 +35,7 @@ public final class MonitorService extends Service {
     static volatile long calibrationMotionAt;
     private static volatile CaptureHealth captureHealth;
     private static volatile String capture = "stopped";
+    private static volatile MonitorService current;
     // A rapid Stop/Start must finish the previous camera and archive before reopening them.
     private static final HandlerThread cameraThread = new HandlerThread("DoorcamCapture");
     static { cameraThread.start(); }
@@ -55,10 +56,22 @@ public final class MonitorService extends Service {
     private Archive archive;
     private RemoteLink remote;
     private CameraMonitor camera;
+    private CameraPreview.Output displayPreview;
     private final LiveMp4 live = new LiveMp4();
     private LanServer lan;
     private Network wifi;
     private ConnectivityManager.NetworkCallback wifiCallback;
+
+    // Called on the capture looper.
+    static boolean setDisplayPreview(CameraPreview.Output output, boolean show) {
+        MonitorService service = current;
+        if (service == null || service.destroyed) return false;
+        if (show || service.displayPreview == output) {
+            service.displayPreview = show ? output : null;
+            if (service.camera != null) service.camera.setPreview(service.displayPreview);
+        }
+        return true;
+    }
 
     static String captureState() {
         String state = capture;
@@ -107,6 +120,7 @@ public final class MonitorService extends Service {
             return START_NOT_STICKY;
         }
         started = true;
+        current = this;
         running = true;
         captureHealth = null;
         capture = "starting";
@@ -149,6 +163,7 @@ public final class MonitorService extends Service {
                 @Override public void failed(Exception e) { retry(e); }
             }, settings.getInt("sensitivity", 50));
             captureHealth = camera.health;
+            camera.setPreview(displayPreview);
             camera.start(settings.getString("camera", "0"));
         } catch (Exception e) { retry(e); }
     }
@@ -215,6 +230,7 @@ public final class MonitorService extends Service {
         destroyed = true;
         running = false;
         if (started) {
+            current = null;
             capture = "stopped";
             captureHealth = null;
             status = "Наблюдение остановлено";

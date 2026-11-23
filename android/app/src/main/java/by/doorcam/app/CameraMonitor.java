@@ -7,6 +7,7 @@ import android.graphics.BitmapFactory;
 import android.graphics.ImageFormat;
 import android.graphics.Matrix;
 import android.graphics.Rect;
+import android.graphics.SurfaceTexture;
 import android.graphics.YuvImage;
 import android.hardware.camera2.*;
 import android.hardware.camera2.params.StreamConfigurationMap;
@@ -23,6 +24,7 @@ import android.view.WindowManager;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -44,14 +46,9 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
     private long previousPreview;
     private int rotation;
     private boolean closed, ready;
-    volatile byte[] previewFrame;
     private final Runnable checkCapture = new Runnable() {
         @Override public void run() {
             if (closed) return;
-            if (archive == null) {
-                if (previewFrame == null) failed(new IOException("Камера не передаёт кадры"));
-                return;
-            }
             String failure = health.failure(SystemClock.elapsedRealtime());
             if (failure != null) {
                 failed(new IOException(failure));
@@ -66,6 +63,11 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
     };
     private CameraDevice camera;
     private CameraCaptureSession session;
+    private int configuration;
+    private CameraPreview.Output preview;
+    private CameraCharacteristics characteristics;
+    private Size previewSize;
+    private List<Surface> recordingTargets = Collections.emptyList();
     private ImageReader reader;
     private SegmentEncoder encoder;
 
@@ -81,6 +83,12 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
 
     CameraMonitor(Context context, Handler worker, State state) {
         this(context, worker, null, null, null, state, 0);
+    }
+
+    void setPreview(CameraPreview.Output output) {
+        if (closed || preview == output) return;
+        preview = output;
+        if (camera != null) configure();
     }
 
     @Override public long now() { return epoch + SystemClock.elapsedRealtime(); }
@@ -101,49 +109,29 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
     void start(String id) throws Exception {
         CameraManager manager = context.getSystemService(CameraManager.class);
         CameraCharacteristics caps = manager.getCameraCharacteristics(id);
+        characteristics = caps;
         StreamConfigurationMap streams = caps.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
         if (streams == null) throw new IOException("Сведения о камере недоступны");
-        Size analysis = select(streams.getOutputSizes(ImageFormat.YUV_420_888), 640, 480);
+        Size[] previews = streams.getOutputSizes(SurfaceTexture.class);
+        if (previews != null && previews.length != 0) previewSize = select(previews, 640, 480);
         Integer sensor = caps.get(CameraCharacteristics.SENSOR_ORIENTATION);
         int display = context.getSystemService(WindowManager.class).getDefaultDisplay().getRotation() * 90;
         Integer lens = caps.get(CameraCharacteristics.LENS_FACING);
         rotation = ((sensor == null ? 0 : sensor) + (lens != null && lens == CameraCharacteristics.LENS_FACING_FRONT ? display : -display) + 360) % 360;
-        reader = ImageReader.newInstance(analysis.getWidth(), analysis.getHeight(), ImageFormat.YUV_420_888, 3);
-        reader.setOnImageAvailableListener(this::analyze, worker);
-        Surface imageSurface = reader.getSurface();
-        boolean recording = archive != null;
-        List<Surface> targets;
-        if (recording) {
+        if (archive != null) {
+            Size analysis = select(streams.getOutputSizes(ImageFormat.YUV_420_888), 640, 480);
+            reader = ImageReader.newInstance(analysis.getWidth(), analysis.getHeight(), ImageFormat.YUV_420_888, 3);
+            reader.setOnImageAvailableListener(this::analyze, worker);
             Size video = select(streams.getOutputSizes(MediaRecorder.class), 1280, 720);
             encoder = new SegmentEncoder(rotation, this, live);
-            targets = Arrays.asList(encoder.start(video, worker), imageSurface);
-        } else {
-            targets = Collections.singletonList(imageSurface);
+            recordingTargets = Arrays.asList(encoder.start(video, worker), reader.getSurface());
+            worker.postDelayed(checkCapture, 2_000);
         }
-        worker.postDelayed(checkCapture, recording ? 2_000 : 8_000);
         manager.openCamera(id, new CameraDevice.StateCallback() {
             @Override public void onOpened(CameraDevice device) {
                 if (closed) { device.close(); return; }
                 camera = device;
-                try {
-                    CaptureRequest.Builder request = camera.createCaptureRequest(
-                            recording ? CameraDevice.TEMPLATE_RECORD : CameraDevice.TEMPLATE_PREVIEW);
-                    for (Surface target : targets) request.addTarget(target);
-                    Range<Integer> rate = frameRate(caps.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES));
-                    if (rate != null) request.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, rate);
-                    camera.createCaptureSession(targets, new CameraCaptureSession.StateCallback() {
-                        @Override public void onConfigured(CameraCaptureSession configured) {
-                            if (closed) { configured.close(); return; }
-                            session = configured;
-                            try {
-                                configured.setRepeatingRequest(request.build(), null, worker);
-                            } catch (Exception e) { failed(e); }
-                        }
-                        @Override public void onConfigureFailed(CameraCaptureSession cfg) {
-                            failed(new IOException("Камера отклонила конфигурацию захвата"));
-                        }
-                    }, worker);
-                } catch (Exception e) { failed(e); }
+                configure();
             }
             @Override public void onDisconnected(CameraDevice device) {
                 device.close(); failed(new IOException("Камера отключилась"));
@@ -152,6 +140,53 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
                 device.close(); failed(new IOException("Ошибка камеры " + error));
             }
         }, worker);
+    }
+
+    private void configure() {
+        int attempt = ++configuration;
+        CameraPreview.Output output = preview;
+        boolean recording = archive != null;
+        try {
+            List<Surface> targets = new ArrayList<>(recordingTargets);
+            if (output != null) {
+                if (previewSize == null) throw new IOException("Камера не поддерживает предпросмотр");
+                output.configure(characteristics, previewSize);
+                targets.add(output.surface);
+            }
+            CaptureRequest.Builder request = camera.createCaptureRequest(
+                    recording ? CameraDevice.TEMPLATE_RECORD : CameraDevice.TEMPLATE_PREVIEW);
+            for (Surface target : targets) request.addTarget(target);
+            if (recording) {
+                Range<Integer> rate = frameRate(characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES));
+                if (rate != null) request.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, rate);
+            }
+            camera.createCaptureSession(targets, new CameraCaptureSession.StateCallback() {
+                @Override public void onConfigured(CameraCaptureSession configured) {
+                    if (closed || attempt != configuration) {
+                        configured.close();
+                        return;
+                    }
+                    session = configured;
+                    try {
+                        configured.setRepeatingRequest(request.build(), null, worker);
+                    } catch (Exception e) { configurationFailed(output, e); }
+                }
+                @Override public void onConfigureFailed(CameraCaptureSession cfg) {
+                    if (!closed && attempt == configuration)
+                        configurationFailed(output, new IOException("Камера отклонила конфигурацию захвата"));
+                }
+            }, worker);
+        } catch (Exception e) { configurationFailed(output, e); }
+    }
+
+    private void configurationFailed(CameraPreview.Output output, Exception error) {
+        if (archive != null && output != null) {
+            preview = null;
+            output.failed(error);
+            configure();
+        } else {
+            failed(error);
+        }
     }
 
     private static Size select(Size[] choices, int width, int height) throws IOException {
@@ -183,13 +218,6 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
             if (image == null || now - previousFrame < 180) return;
             previousFrame = now;
             long elapsed = SystemClock.elapsedRealtime();
-            if (archive == null) {
-                if (elapsed - previousPreview >= 250) {
-                    previousPreview = elapsed;
-                    previewFrame = jpeg(image);
-                }
-                return;
-            }
             health.frame(elapsed);
             byte[] photo = null;
             if (!MonitorService.motionEnabled) {
@@ -203,12 +231,12 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
                     encoder.onMotion(now);
                 }
             }
-            if (MonitorService.previewVisible && elapsed - previousPreview >= 500) {
+            if (MonitorService.previewVisible && elapsed - previousPreview >= 1_000) {
                 previousPreview = elapsed;
                 try {
                     MonitorService.previewFrame = photo != null ? photo : jpeg(image);
                 } catch (IOException e) {
-                    Log.w("Doorcam", "Предпросмотр камеры", e);
+                    Log.w("Doorcam", "Предпросмотр зоны", e);
                 }
             }
         } catch (Exception error) { failed(error); }
@@ -268,7 +296,6 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
     @Override public void close() {
         if (closed) return;
         closed = true;
-        previewFrame = null;
         worker.removeCallbacks(checkCapture);
         if (session != null) session.close();
         if (camera != null) camera.close();

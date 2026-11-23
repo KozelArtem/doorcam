@@ -222,51 +222,52 @@ public final class MainActivity extends Activity {
         frame.setClipToOutline(true);
         int height = Math.min(260, getResources().getConfiguration().screenHeightDp / 2);
         content.addView(frame, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(height)));
-        ImageView image = new ImageView(this);
-        image.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        image.setContentDescription("Изображение с камеры");
-        frame.addView(image, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         ImageView lens = new ImageView(this);
         lens.setImageResource(R.drawable.doorcam_lens);
         lens.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
-        frame.addView(lens, new FrameLayout.LayoutParams(dp(44), dp(44), Gravity.CENTER));
         TextView previewStatus = label(content, "Ждём кадр с камеры…", 13, R.color.doorcam_muted, 8);
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle("Предпросмотр камеры").setView(content)
                 .setPositiveButton("Закрыть", null).create();
-        Handler worker = MonitorService.captureHandler();
-        CameraMonitor local = active ? null : new CameraMonitor(this, worker, new CameraMonitor.State() {
-            @Override public void ready() { }
-            @Override public void failed(Exception error) {
-                Log.w("Doorcam", "Предпросмотр камеры", error);
-                ui.post(() -> {
-                    if (dialog.isShowing()) previewStatus.setText("Не удалось получить изображение с камеры");
-                });
-            }
-        });
-        Runnable refreshPreview = new Runnable() {
+        ImageView still = new ImageView(this);
+        still.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        Runnable fallback = new Runnable() {
             private byte[] displayed;
             @Override public void run() {
                 if (!dialog.isShowing()) return;
-                byte[] bytes = local == null ? MonitorService.previewFrame : local.previewFrame;
+                byte[] bytes = MonitorService.previewFrame;
                 if (bytes != displayed) {
                     displayed = bytes;
-                    image.setImageBitmap(bytes == null ? null : BitmapFactory.decodeByteArray(bytes, 0, bytes.length));
+                    still.setImageBitmap(bytes == null ? null : BitmapFactory.decodeByteArray(bytes, 0, bytes.length));
                     lens.setVisibility(bytes == null ? View.VISIBLE : View.GONE);
-                    previewStatus.setVisibility(bytes == null ? View.VISIBLE : View.GONE);
                 }
-                if (local == null && bytes == null) {
-                    String status = MonitorService.captureState();
-                    previewStatus.setText("ok".equals(status) || "starting".equals(status)
-                            ? "Ждём кадр с камеры…" : MonitorService.status);
-                }
-                ui.postDelayed(this, 250);
+                ui.postDelayed(this, 500);
             }
         };
+        CameraPreview video = new CameraPreview(this, active ? null : ids.get(selection), () -> {
+            ui.removeCallbacks(fallback);
+            MonitorService.previewVisible = false;
+            still.setImageDrawable(null);
+            lens.setVisibility(View.GONE);
+            previewStatus.setVisibility(View.GONE);
+        }, error -> {
+            if (!dialog.isShowing()) return;
+            Log.w("Doorcam", "Предпросмотр камеры", error);
+            if (active && MonitorService.running) {
+                previewStatus.setText("Непрерывный предпросмотр недоступен. Показываем кадры.");
+                MonitorService.previewVisible = true;
+                ui.removeCallbacks(fallback);
+                ui.post(fallback);
+            } else {
+                previewStatus.setText("Не удалось получить изображение с камеры");
+            }
+        });
+        video.setContentDescription("Изображение с камеры");
+        frame.addView(video, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        frame.addView(still, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        frame.addView(lens, new FrameLayout.LayoutParams(dp(44), dp(44), Gravity.CENTER));
         cameraPreviewDialog = dialog;
-        MonitorService.previewVisible = active;
         dialog.setOnDismissListener(dismissed -> {
-            ui.removeCallbacks(refreshPreview);
-            if (local != null) worker.post(local::close);
+            ui.removeCallbacks(fallback);
             cameraPreviewDialog = null;
             updateCalibrationVisibility();
         });
@@ -274,17 +275,6 @@ public final class MainActivity extends Activity {
         dialog.getWindow().setBackgroundDrawable(new InsetDrawable(
                 surface(R.color.doorcam_surface, 22, R.color.doorcam_border), dp(12), 0, dp(12), 0));
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setAllCaps(false);
-        if (local != null) {
-            String cameraId = ids.get(selection);
-            worker.post(() -> {
-                try {
-                    local.start(cameraId);
-                } catch (Exception error) {
-                    local.failed(error);
-                }
-            });
-        }
-        ui.post(refreshPreview);
     }
 
     private void buildWifi(LinearLayout wifi) {
@@ -465,9 +455,9 @@ public final class MainActivity extends Activity {
 
     private void updateCalibrationVisibility() {
         boolean calibrating = isCalibrating();
-        MonitorService.previewVisible = calibrating || cameraPreviewDialog != null;
+        MonitorService.previewVisible = calibrating;
         if (calibrating) refreshCalibration(MonitorService.running);
-        if (cameraPreviewDialog == null && !calibrating) MonitorService.previewFrame = null;
+        if (!calibrating) MonitorService.previewFrame = null;
         if (!calibrating) clearCalibrationPreview();
     }
 
