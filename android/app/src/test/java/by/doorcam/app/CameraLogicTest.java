@@ -23,6 +23,20 @@ public class CameraLogicTest {
         assertFalse(detector.observe(pixels));
     }
 
+    @Test public void exposureCompensationIncludesTwentyLevelsAtHistogramEdges() {
+        MotionDetector detector = new MotionDetector(50);
+        byte[] pixels = new byte[100];
+        assertFalse(detector.observe(pixels));
+        Arrays.fill(pixels, (byte) 255);
+        Arrays.fill(pixels, 0, 10, (byte) 235);
+        assertFalse(detector.observe(pixels));
+        Arrays.fill(pixels, (byte) 0);
+        Arrays.fill(pixels, 0, 10, (byte) 1);
+        assertTrue(detector.observe(pixels));
+        Arrays.fill(pixels, (byte) 255);
+        assertFalse(detector.observe(pixels));
+    }
+
     @Test public void shortPassKeepsPreRollAndTailAndQueuesOnePhoto() throws Exception {
         Archive archive = new Archive(temp.getRoot(), 1024 * 1024);
         Archive.Segment first = segment(10000);

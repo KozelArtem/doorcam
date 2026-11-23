@@ -57,7 +57,10 @@ public class LanTest {
             assertEquals("moof", type(key, 4));
             int mdat = ByteBuffer.wrap(key).getInt();
             assertEquals("mdat", type(key, mdat + 4));
-            assertEquals(2, ByteBuffer.wrap(key).getInt(mdat + 8));
+            assertEquals(mdat + 8, ByteBuffer.wrap(key).getInt(mdat - 16));
+            assertEquals(key.length - mdat, ByteBuffer.wrap(key).getInt(mdat));
+            assertArrayEquals(new byte[]{0, 0, 0, 2, 101, 2},
+                    java.util.Arrays.copyOfRange(key, mdat + 8, key.length));
             live.sample(new byte[]{0, 0, 0, 1, 65, 4}, 1_181_000, false);
             byte[] delta = viewer.frames.remove();
             assertEquals("tfdt", type(delta, 52));

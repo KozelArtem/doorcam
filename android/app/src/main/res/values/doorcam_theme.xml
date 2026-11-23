@@ -1,0 +1,22 @@
+<resources>
+    <color name="doorcam_background">#101A21</color>
+    <color name="doorcam_surface">#18252D</color>
+    <color name="doorcam_hero">#233D3D</color>
+    <color name="doorcam_border">#344A52</color>
+    <color name="doorcam_text">#ECF1EF</color>
+    <color name="doorcam_muted">#B5C5C9</color>
+    <color name="doorcam_accent">#A9EFCD</color>
+    <color name="doorcam_on_accent">#0C3024</color>
+    <color name="doorcam_stop">#FFC2B6</color>
+
+    <style name="DoorcamTheme" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/doorcam_background</item>
+        <item name="android:colorBackground">@color/doorcam_background</item>
+        <item name="android:statusBarColor">@color/doorcam_background</item>
+        <item name="android:navigationBarColor">@color/doorcam_background</item>
+        <item name="android:colorAccent">@color/doorcam_accent</item>
+        <item name="android:textColorPrimary">@color/doorcam_text</item>
+        <item name="android:textColorSecondary">@color/doorcam_muted</item>
+        <item name="android:textColorLink">@color/doorcam_accent</item>
+    </style>
+</resources>

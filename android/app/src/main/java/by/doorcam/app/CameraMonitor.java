@@ -27,6 +27,7 @@ import java.util.Arrays;
 
 final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
     interface State { void ready(); void failed(Exception e); }
+    private static final int SAMPLE_COLUMNS = 48, SAMPLE_ROWS = 32;
     private final Context context;
     private final Handler worker;
     private final Archive archive;
@@ -34,6 +35,7 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
     private final LiveMp4 live;
     private final State state;
     private final MotionDetector detector;
+    private final byte[] samples = new byte[SAMPLE_COLUMNS * SAMPLE_ROWS];
     private final long epoch = System.currentTimeMillis() - SystemClock.elapsedRealtime();
     private long previousFrame;
     private int rotation;
@@ -143,11 +145,14 @@ final class CameraMonitor implements AutoCloseable, SegmentEncoder.Listener {
             previousFrame = now;
             Image.Plane y = image.getPlanes()[0];
             ByteBuffer buf = y.getBuffer();
-            byte[] samples = new byte[48 * 32];
-            for (int row = 0; row < 32; row++) for (int col = 0; col < 48; col++) {
-                int x = col * image.getWidth() / 48;
-                int yy = row * image.getHeight() / 32;
-                samples[row * 48 + col] = buf.get(buf.position() + yy * y.getRowStride() + x * y.getPixelStride());
+            int width = image.getWidth(), height = image.getHeight();
+            int rowStride = y.getRowStride(), pixelStride = y.getPixelStride();
+            int base = buf.position(), sample = 0;
+            for (int row = 0; row < SAMPLE_ROWS; row++) {
+                int offset = base + (row * height / SAMPLE_ROWS) * rowStride;
+                for (int col = 0; col < SAMPLE_COLUMNS; col++) {
+                    samples[sample++] = buf.get(offset + (col * width / SAMPLE_COLUMNS) * pixelStride);
+                }
             }
             if (detector.observe(samples)) {
                 File pending = archive.motion(now, archive.needsPhoto(now) ? jpeg(image) : null);

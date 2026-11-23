@@ -10,6 +10,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 
 final class LiveMp4 {
     private static final int TRACK = 1, TIMESCALE = 1_000_000;
+    private static final byte[] MDAT = ascii("mdat");
     private static final byte[] MATRIX = words(65536, 0, 0, 0, 65536, 0, 0, 0, 1 << 30);
     private final List<Viewer> viewers = new ArrayList<>();
     private byte[] init, pending;
@@ -156,7 +157,9 @@ final class LiveMp4 {
                 box("traf", box("tfhd", words(0x020000, TRACK)),
                         box("tfdt", words(1 << 24, (int) (time >>> 32), (int) time)), box("trun", run)));
         ByteBuffer.wrap(moof).putInt(moof.length - run.length + 8, moof.length + 8);
-        return join(moof, box("mdat", sample));
+        int mdatSize = 8 + sample.length;
+        return ByteBuffer.allocate(moof.length + mdatSize)
+                .put(moof).putInt(mdatSize).put(MDAT).put(sample).array();
     }
 
     private static byte[] words(int... values) {
